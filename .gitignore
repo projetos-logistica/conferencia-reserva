@@ -1,0 +1,21 @@
+# Ambiente virtual
+.venv/
+venv/
+
+# Variáveis de ambiente / segredos
+.env
+.env.*
+
+# Cache Python
+__pycache__/
+*.pyc
+
+# Streamlit
+.streamlit/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
