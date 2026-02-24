@@ -16,7 +16,7 @@ st.set_page_config(page_title="Gestão Reserva - AZZAS", layout="wide")
 # --- 2. FUNÇÕES DE SUPORTE E ESTILO ---
 
 def get_now_br():
-    """Retorna o horário atual de Brasília (limpo) para evitar soma de fuso no banco."""
+    """Retorna o horário atual de Brasília limpo."""
     fuso = pytz.timezone('America/Sao_Paulo')
     return datetime.now(fuso).replace(tzinfo=None).isoformat()
 
@@ -26,6 +26,39 @@ def get_base64_of_bin_file(bin_file):
             data = f.read()
         return base64.b64encode(data).decode()
     return ""
+
+def imprimir_romaneio_html(id_romaneio, df_volumes, usuario):
+    """Gera o componente HTML/JS para disparar a impressão profissional."""
+    html_print = f"""
+    <div id="printarea" style="font-family: sans-serif; padding: 20px;">
+        <h2 style="text-align: center; border-bottom: 2px solid #000;">ROMANEIO DE EXPEDIÇÃO - AZZAS</h2>
+        <p><strong>Nº Romaneio:</strong> {id_romaneio} | <strong>Origem:</strong> CD Reserva</p>
+        <p><strong>Usuário Responsável:</strong> {usuario}</p>
+        <p><strong>Data de Emissão:</strong> {datetime.now().strftime('%d/%m/%Y %H:%M')}</p>
+        <table style="width: 100%; border-collapse: collapse; margin-top: 15px;">
+            <thead>
+                <tr style="background: #eee;">
+                    <th style="border: 1px solid #000; padding: 8px; text-align: left;">Chave NFe (Volumes)</th>
+                </tr>
+            </thead>
+            <tbody>
+                {"".join([f"<tr><td style='border: 1px solid #000; padding: 8px;'>{r['chave_nfe']}</td></tr>" for _, r in df_volumes.iterrows()])}
+            </tbody>
+        </table>
+        <div style="margin-top: 60px; text-align: center;">
+            <p>___________________________________________________</p>
+            <p>Assinatura Responsável</p>
+        </div>
+    </div>
+    <script>
+        var content = document.getElementById('printarea').innerHTML;
+        var win = window.open('', '', 'height=700,width=900');
+        win.document.write('<html><head><title>Imprimir Romaneio</title></head><body>' + content + '</body></html>');
+        win.document.close();
+        setTimeout(function(){{ win.print(); win.close(); }}, 500);
+    </script>
+    """
+    return st.components.v1.html(html_print, height=0)
 
 def show_login():
     bg_img = get_base64_of_bin_file("Fundo tela login.png")
@@ -75,23 +108,33 @@ else:
             st.title("🚛 Expedição CD RESERVA")
             if "romaneio_id" not in st.session_state:
                 if st.button("🚀 ABRIR NOVO ROMANEIO"):
-                    res = supabase.table("romaneios").insert({"usuario_criou": st.session_state['user_email'], "unidade_origem": "CD Reserva", "status": "Aberto"}).execute()
+                    res = supabase.table("romaneios").insert({
+                        "usuario_criou": st.session_state['user_email'], 
+                        "unidade_origem": "CD Reserva", "status": "Aberto"
+                    }).execute()
                     st.session_state["romaneio_id"] = res.data[0]['id']
                     st.rerun()
             else:
                 id_atual = st.session_state["romaneio_id"]
                 st.info(f"📦 Romaneio Ativo: **#{id_atual}**")
+                
                 def reg_reserva():
                     chave = st.session_state.input_reserva.strip()
                     if chave:
                         try:
-                            supabase.table("conferencia_reserva").insert({"chave_nfe": chave, "romaneio_id": id_atual, "data_expedicao": get_now_br()}).execute()
+                            supabase.table("conferencia_reserva").insert({
+                                "chave_nfe": chave, "romaneio_id": id_atual, "data_expedicao": get_now_br()
+                            }).execute()
                             st.toast(f"✅ Bipado: {chave[-10:]}")
                         except Exception as e: st.error(f"Erro: {e}")
                         st.session_state.input_reserva = ""
+                
                 st.text_input("Bipe os volumes:", key="input_reserva", on_change=reg_reserva)
+                
                 if st.button("🏁 ENCERRAR ROMANEIO"):
-                    supabase.table("romaneios").update({"status": "Encerrado", "data_encerramento": get_now_br()}).eq("id", id_atual).execute()
+                    supabase.table("romaneios").update({
+                        "status": "Encerrado", "data_encerramento": get_now_br()
+                    }).eq("id", id_atual).execute()
                     st.session_state["resumo_pronto"] = id_atual
                     del st.session_state["romaneio_id"]
                     st.rerun()
@@ -101,8 +144,11 @@ else:
                 bipes = supabase.table("conferencia_reserva").select("chave_nfe").eq("romaneio_id", id_resumo).execute()
                 with st.container(border=True):
                     st.subheader(f"📄 Resumo Romaneio #{id_resumo}")
-                    if bipes.data: st.table(pd.DataFrame(bipes.data))
-                    if st.button("🖨️ Imprimir"): st.markdown("<script>window.print();</script>", unsafe_allow_html=True)
+                    df_res = pd.DataFrame(bipes.data) if bipes.data else pd.DataFrame()
+                    if not df_res.empty:
+                        st.table(df_res)
+                        if st.button("🖨️ Imprimir Agora"):
+                            imprimir_romaneio_html(id_resumo, df_res, st.session_state['user_email'])
                     if st.button("➕ Iniciar Novo"):
                         del st.session_state["resumo_pronto"]
                         st.rerun()
@@ -133,36 +179,54 @@ else:
                                 st.session_state["conferidos_agora"].append(chave)
                                 st.toast("✅ Validado!")
                             else: st.warning("Já bipado.")
-                        else: st.error("Volume não pertence a este romaneio!")
+                        else: st.error("Volume inválido!")
                         st.session_state.input_pavuna = ""
                 st.text_input("Bipe a entrada:", key="input_pavuna", on_change=reg_pavuna)
                 st.metric("Progresso", f"{len(st.session_state['conferidos_agora'])} / {len(lista_esperada)}")
                 if st.button("🏁 FINALIZAR"):
                     faltas = [c for c in lista_esperada if c not in st.session_state["conferidos_agora"]]
-                    if not faltas: st.success("Carga OK!")
-                    else: st.error(f"Faltas: {len(faltas)}"); st.table(pd.DataFrame(faltas))
-                    if st.button("Novo Romaneio"): del st.session_state["romaneio_pavuna"]; st.rerun()
+                    if not faltas: st.success("OK!")
+                    else: 
+                        st.error(f"Faltas: {len(faltas)}")
+                        st.table(pd.DataFrame(faltas, columns=["Chaves Faltantes"]))
+                    if st.button("Sair"): del st.session_state["romaneio_pavuna"]; st.rerun()
 
-    # --- ABA BASE DE DADOS (FILTROS COM CORREÇÃO DE HORA) ---
+    # --- ABA BASE DE DADOS (COM NOVA SINTAXE WIDTH='STRETCH') ---
     with tab_base:
-        st.title("📊 Consulta")
+        st.title("📊 Consulta e Reimpressão")
         with st.container(border=True):
             c1, c2, c3 = st.columns(3)
-            f_rom = c1.text_input("Nº Romaneio", key="filter_rom")
+            f_rom = c1.text_input("Pesquisar Nº Romaneio", key="filter_rom")
             dt_ini = c2.date_input("Início", value=None)
             dt_fim = c3.date_input("Fim", value=None)
-            if st.button("🔍 Pesquisar"):
-                q = supabase.table("conferencia_reserva").select("*, romaneios(*)")
-                if f_rom: q = q.eq("romaneio_id", f_rom)
-                if dt_ini: q = q.gte("data_expedicao", dt_ini.strftime('%Y-%m-%d'))
-                if dt_fim: q = q.lte("data_expedicao", dt_fim.strftime('%Y-%m-%d'))
-                res = q.order("data_expedicao", desc=True).execute()
-                if res.data:
-                    df = pd.json_normalize(res.data)
-                    # CONVERSÃO DE FUSO PARA EXIBIÇÃO
-                    for col in ['data_expedicao', 'data_recebimento', 'romaneios.data_encerramento']:
-                        if col in df.columns:
-                            df[col] = pd.to_datetime(df[col]).dt.tz_localize('UTC', ambiguous='infer').dt.tz_convert('America/Sao_Paulo')
-                            df[col] = df[col].dt.strftime('%d/%m/%Y %H:%M:%S')
-                    st.dataframe(df, use_container_width=True)
-                else: st.warning("Nada encontrado.")
+            
+            btn_search = st.button("🔍 Pesquisar")
+
+        if btn_search or f_rom:
+            q = supabase.table("conferencia_reserva").select("*, romaneios(*)")
+            if f_rom: q = q.eq("romaneio_id", f_rom)
+            if dt_ini: q = q.gte("data_expedicao", dt_ini.strftime('%Y-%m-%d'))
+            if dt_fim: q = q.lte("data_expedicao", dt_fim.strftime('%Y-%m-%d'))
+            
+            res = q.order("data_expedicao", desc=True).execute()
+            
+            if res.data:
+                df = pd.json_normalize(res.data)
+                for col in ['data_expedicao', 'data_recebimento', 'romaneios.data_encerramento']:
+                    if col in df.columns and df[col].notnull().any():
+                        df[col] = pd.to_datetime(df[col])
+                        if df[col].dt.tz is None: df[col] = df[col].dt.tz_localize('UTC')
+                        df[col] = df[col].dt.tz_convert('America/Sao_Paulo').dt.strftime('%d/%m/%Y %H:%M:%S')
+                
+                # ATUALIZADO: width='stretch' substitui use_container_width=True
+                st.dataframe(df, width='stretch')
+
+                if f_rom:
+                    st.divider()
+                    st.subheader(f"🖨️ Ações para o Romaneio #{f_rom}")
+                    if st.button("📥 Gerar Impressão do Romaneio"):
+                        df_print = df[['chave_nfe']]
+                        user_origem = res.data[0]['romaneios']['usuario_criou']
+                        imprimir_romaneio_html(f_rom, df_print, user_origem)
+            else:
+                st.warning("Nenhum registro encontrado.")
