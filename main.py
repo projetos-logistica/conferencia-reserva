@@ -7,8 +7,13 @@ import base64
 import os
 
 # --- 1. CONFIGURAÇÕES E CONEXÃO ---
-SUPABASE_URL = st.secrets["SUPABASE_URL"]
-SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
+# Certifique-se de configurar SUPABASE_URL e SUPABASE_KEY no painel do Streamlit Cloud
+try:
+    SUPABASE_URL = st.secrets["SUPABASE_URL"]
+    SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
+except Exception:
+    st.error("Erro: Credenciais do Supabase não encontradas nos Secrets.")
+    st.stop()
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -17,9 +22,8 @@ st.set_page_config(page_title="Gestão Reserva - AZZAS", layout="wide")
 # --- 2. FUNÇÕES DE SUPORTE E ESTILO ---
 
 def get_now_br():
-    """Retorna o horário atual de Brasília com informação de fuso para o Supabase."""
+    """Retorna o horário atual de Brasília formatado para o Supabase."""
     fuso = pytz.timezone('America/Sao_Paulo')
-    # Enviamos com o fuso para o banco entender que é -03:00
     return datetime.now(fuso).isoformat()
 
 def get_base64_of_bin_file(bin_file):
@@ -29,13 +33,10 @@ def get_base64_of_bin_file(bin_file):
         return base64.b64encode(data).decode()
     return ""
 
-# Primeiro, pegue o horário correto de Brasília
-fuso = pytz.timezone('America/Sao_Paulo')
-agora_br = datetime.now(fuso).strftime('%d/%m/%Y %H:%M')
-
-
 def imprimir_romaneio_html(id_romaneio, df_volumes, usuario):
-    """Gera o componente HTML/JS para disparar a impressão profissional."""
+    fuso = pytz.timezone('America/Sao_Paulo')
+    agora_br = datetime.now(fuso).strftime('%d/%m/%Y %H:%M')
+    
     html_print = f"""
     <div id="printarea" style="font-family: sans-serif; padding: 20px;">
         <h2 style="text-align: center; border-bottom: 2px solid #000;">ROMANEIO DE EXPEDIÇÃO - AZZAS</h2>
@@ -100,7 +101,6 @@ def show_login():
 if "auth" not in st.session_state:
     show_login()
 else:
-    # Sidebar
     st.sidebar.title(f"🏢 {st.session_state['unidade']}")
     st.sidebar.write(f"👤 {st.session_state['user_email']}")
     if st.sidebar.button("Sair"):
@@ -110,16 +110,15 @@ else:
     tab_op, tab_base = st.tabs(["🎯 Operação", "📊 Base de Dados"])
 
     with tab_op:
-        # --- CD RESERVA ---
         if st.session_state['unidade'] == "CD Reserva":
             st.title("🚛 Expedição CD RESERVA")
             if "romaneio_id" not in st.session_state:
                 if st.button("🚀 ABRIR NOVO ROMANEIO"):
+                    # Erro PGRST204 evitado: Não enviamos created_at, o banco gera sozinho
                     res = supabase.table("romaneios").insert({
                         "usuario_criou": st.session_state['user_email'], 
                         "unidade_origem": "CD Reserva", 
-                        "status": "Aberto",
-                        "created_at": get_now_br() # Adicione se o campo existir no seu banco
+                        "status": "Aberto"
                     }).execute()
                     st.session_state["romaneio_id"] = res.data[0]['id']
                     st.rerun()
@@ -127,14 +126,8 @@ else:
                 id_atual = st.session_state["romaneio_id"]
                 st.info(f"📦 Romaneio Ativo: **#{id_atual}**")
 
-                # 1. Buscar do banco quantos volumes já existem para esse romaneio
-                res_count = supabase.table("conferencia_reserva")\
-                    .select("id", count="exact")\
-                    .eq("romaneio_id", id_atual).execute()
-
+                res_count = supabase.table("conferencia_reserva").select("id", count="exact").eq("romaneio_id", id_atual).execute()
                 total_bipado = res_count.count if res_count.count else 0
-
-                # 2. Exibir o contador de forma destacada
                 st.metric(label="Volumes Bipados", value=total_bipado)
 
                 def reg_reserva():
@@ -149,11 +142,8 @@ else:
                             st.toast(f"✅ Bipado: {chave[-10:]}")
                         except Exception as e: 
                             st.error(f"Erro ao registrar: {e}")
-                        
-                        # Limpa o campo para o próximo bipe
                         st.session_state.input_reserva = ""
 
-                # 3. Campo de input
                 st.text_input("Bipe os volumes:", key="input_reserva", on_change=reg_reserva)
                 
                 if st.button("🏁 ENCERRAR ROMANEIO"):
@@ -164,37 +154,24 @@ else:
                     del st.session_state["romaneio_id"]
                     st.rerun()
 
-            if "resumo_pronto" in st.session_state:
-                id_resumo = st.session_state["resumo_pronto"]
-                bipes = supabase.table("conferencia_reserva").select("chave_nfe").eq("romaneio_id", id_resumo).execute()
-                with st.container(border=True):
-                    st.subheader(f"📄 Resumo Romaneio #{id_resumo}")
-                    df_res = pd.DataFrame(bipes.data) if bipes.data else pd.DataFrame()
-                    if not df_res.empty:
-                        st.table(df_res)
-                        if st.button("🖨️ Imprimir Agora"):
-                            imprimir_romaneio_html(id_resumo, df_res, st.session_state['user_email'])
-                    if st.button("➕ Iniciar Novo"):
-                        del st.session_state["resumo_pronto"]
-                        st.rerun()
-
-        # --- CD PAVUNA ---
         elif st.session_state['unidade'] == "CD Pavuna":
             st.title("📥 Recebimento CD PAVUNA")
             if "romaneio_pavuna" not in st.session_state:
                 id_input = st.text_input("Digite o Nº do Romaneio:")
-                if st.button("🔍 Abrir Romaneio"):
-                    check = supabase.table("romaneios").select("*").eq("id", id_input).eq("status", "Encerrado").execute()
+                # Erro 22P02 evitado: Só executa se houver input
+                if id_input and st.button("🔍 Abrir Romaneio"):
+                    check = supabase.table("romaneios").select("*").eq("id", int(id_input)).eq("status", "Encerrado").execute()
                     if check.data:
                         st.session_state["romaneio_pavuna"] = id_input
                         st.session_state["conferidos_agora"] = []
                         st.rerun()
-                    else: st.error("❌ Romaneio inválido ou aberto.")
+                    else: st.error("❌ Romaneio inválido ou ainda aberto.")
             else:
                 rom_id = st.session_state["romaneio_pavuna"]
                 st.info(f"✅ Conferindo Romaneio: **#{rom_id}**")
                 res_envio = supabase.table("conferencia_reserva").select("chave_nfe").eq("romaneio_id", rom_id).execute()
                 lista_esperada = [item['chave_nfe'] for item in res_envio.data]
+                
                 def reg_pavuna():
                     chave = st.session_state.input_pavuna.strip()
                     if chave:
@@ -204,32 +181,28 @@ else:
                                 st.session_state["conferidos_agora"].append(chave)
                                 st.toast("✅ Validado!")
                             else: st.warning("Já bipado.")
-                        else: st.error("Volume inválido!")
+                        else: st.error("Volume não pertence a este romaneio!")
                         st.session_state.input_pavuna = ""
+
                 st.text_input("Bipe a entrada:", key="input_pavuna", on_change=reg_pavuna)
                 st.metric("Progresso", f"{len(st.session_state['conferidos_agora'])} / {len(lista_esperada)}")
-                # --- DENTRO DO BLOCO 'CD Pavuna' ---
-                if st.button("🏁 FINALIZAR"):
+                
+                if st.button("🏁 FINALIZAR CONFERÊNCIA"):
                     faltas = [c for c in lista_esperada if c not in st.session_state["conferidos_agora"]]
-                    
                     if not faltas:
                         st.success("✅ Tudo conferido com sucesso!")
-                        # Criamos uma marcação no estado para mostrar o botão de próximo
                         st.session_state["concluido_pavuna"] = True
                     else: 
                         st.error(f"⚠️ Atenção! Faltam: {len(faltas)} volumes")
                         st.table(pd.DataFrame(faltas, columns=["Chaves Faltantes"]))
 
-                # Se a conferência foi concluída, mostra o botão para o próximo
                 if st.session_state.get("concluido_pavuna"):
                     if st.button("📦 PRÓXIMO ROMANEIO", type="primary"):
-                        # Limpa as variáveis do romaneio atual
                         del st.session_state["romaneio_pavuna"]
                         del st.session_state["conferidos_agora"]
                         del st.session_state["concluido_pavuna"]
                         st.rerun()
 
-    # --- ABA BASE DE DADOS (COM NOVA SINTAXE WIDTH='STRETCH') ---
     with tab_base:
         st.title("📊 Consulta e Reimpressão")
         with st.container(border=True):
@@ -237,12 +210,11 @@ else:
             f_rom = c1.text_input("Pesquisar Nº Romaneio", key="filter_rom")
             dt_ini = c2.date_input("Início", value=None)
             dt_fim = c3.date_input("Fim", value=None)
-            
             btn_search = st.button("🔍 Pesquisar")
 
         if btn_search or f_rom:
             q = supabase.table("conferencia_reserva").select("*, romaneios(*)")
-            if f_rom: q = q.eq("romaneio_id", f_rom)
+            if f_rom and f_rom.isdigit(): q = q.eq("romaneio_id", int(f_rom))
             if dt_ini: q = q.gte("data_expedicao", dt_ini.strftime('%Y-%m-%d'))
             if dt_fim: q = q.lte("data_expedicao", dt_fim.strftime('%Y-%m-%d'))
             
@@ -250,31 +222,18 @@ else:
             
             if res.data:
                 df = pd.json_normalize(res.data)
-                
-                # Lista de colunas de data
                 cols_data = ['data_expedicao', 'data_recebimento', 'romaneios.data_encerramento']
-                
                 for col in cols_data:
                     if col in df.columns and df[col].notnull().any():
-                        # 1. Converte para datetime
                         df[col] = pd.to_datetime(df[col])
-                        
-                        # 2. Se o Pandas não identificou o fuso, define como UTC (padrão do Supabase)
-                        if df[col].dt.tz is None:
-                            df[col] = df[col].dt.tz_localize('UTC')
-                        
-                        # 3. Converte para o fuso de Brasília e formata para string amigável
+                        if df[col].dt.tz is None: df[col] = df[col].dt.tz_localize('UTC')
                         df[col] = df[col].dt.tz_convert('America/Sao_Paulo').dt.strftime('%d/%m/%Y %H:%M:%S')
 
-                # Exibe o dataframe corrigido
                 st.dataframe(df, width='stretch')
                 
                 if f_rom:
                     st.divider()
-                    st.subheader(f"🖨️ Ações para o Romaneio #{f_rom}")
-                    if st.button("📥 Gerar Impressão do Romaneio"):
-                        df_print = df[['chave_nfe']]
-                        user_origem = res.data[0]['romaneios']['usuario_criou']
-                        imprimir_romaneio_html(f_rom, df_print, user_origem)
+                    if st.button("📥 Reimprimir Romaneio"):
+                        imprimir_romaneio_html(f_rom, df[['chave_nfe']], res.data[0]['romaneios']['usuario_criou'])
             else:
                 st.warning("Nenhum registro encontrado.")
