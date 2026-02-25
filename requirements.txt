@@ -1,5 +1,6 @@
-streamlit
-supabase
-python-dotenv
+sqlalchemy>=2.0
+pyodbc
 pandas
+supabase
+streamlit
 pytz
