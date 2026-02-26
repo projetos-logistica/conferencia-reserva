@@ -23,6 +23,7 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # --- 2. CONEXÃO SQL SERVER (SQLAlchemy) ---
 @st.cache_resource
+@st.cache_resource
 def get_sqlserver_engine():
     driver = st.secrets["SQLSERVER_DRIVER"]
     server = st.secrets["SQLSERVER_SERVER"]
@@ -30,6 +31,28 @@ def get_sqlserver_engine():
     uid = st.secrets["SQLSERVER_UID"]
     pwd = st.secrets["SQLSERVER_PWD"]
     encrypt = st.secrets.get("SQLSERVER_ENCRYPT", "no")
+
+    conn_str = (
+        f"DRIVER={{{driver}}};"
+        f"SERVER={server};"
+        f"DATABASE={database};"
+        f"UID={uid};"
+        f"PWD={pwd};"
+        f"Encrypt={encrypt};"
+        "TrustServerCertificate=yes;"
+        "Connection Timeout=20;"   # ✅ login timeout
+        "Timeout=30;"              # ✅ query timeout (driver-dependent)
+    )
+
+    params = urllib.parse.quote_plus(conn_str)
+
+    return create_engine(
+        f"mssql+pyodbc:///?odbc_connect={params}",
+        pool_pre_ping=True,
+        pool_recycle=1800,
+        pool_timeout=30,     # ✅ espera por conexão do pool
+        connect_args={"timeout": 20},  # ✅ pyodbc login timeout
+    )
 
     conn_str = (
         f"DRIVER={{{driver}}};"
@@ -51,6 +74,15 @@ def get_sqlserver_engine():
     )
 
 sql_engine = get_sqlserver_engine()
+
+def sql_is_in_cooldown():
+    until = st.session_state.get("sql_cooldown_until")
+    if not until:
+        return False
+    return datetime.utcnow() < until
+
+def set_sql_cooldown(seconds=60):
+    st.session_state["sql_cooldown_until"] = datetime.utcnow() + pd.Timedelta(seconds=seconds)
 
 # --- 3. FUNÇÕES DE SUPORTE ---
 def get_now_br():
