@@ -42,7 +42,13 @@ def get_sqlserver_engine():
     )
 
     params = urllib.parse.quote_plus(conn_str)
-    return create_engine(f"mssql+pyodbc:///?odbc_connect={params}", pool_pre_ping=True)
+
+    # pool_pre_ping ajuda com conexões "mortas" e evita overhead de reconectar o tempo todo
+    return create_engine(
+        f"mssql+pyodbc:///?odbc_connect={params}",
+        pool_pre_ping=True,
+        pool_recycle=1800,
+    )
 
 sql_engine = get_sqlserver_engine()
 
@@ -59,27 +65,34 @@ def get_base64_of_bin_file(bin_file):
         return base64.b64encode(data).decode()
     return ""
 
-@st.cache_data(ttl=3600)
+# ✅ Melhoria: cache mais longo e query mais leve
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
 def buscar_destino_sqlserver(caixa: str):
     """
     Busca DESTINO e FILIAL no SQL Server pela CAIXA.
-    Cache 1h pra não martelar o ERP em bipagens repetidas.
+    - Query otimizada: TOP 1, sem GROUP BY.
+    - NOLOCK (opcional) para reduzir espera por locks no ERP.
+    Cache 24h pra não martelar o ERP.
     """
     if not caixa:
         return None, None
 
+    # Importante:
+    # - Se "CAIXA" tiver índice, esse WHERE fica MUITO mais rápido.
+    # - TOP 1 evita varrer e agrupar desnecessariamente.
+    # - NOLOCK evita travar por lock (aceita risco de leitura suja).
     sql = text("""
-        SELECT 
+        SELECT TOP 1
             F.NOME_CLIFOR AS DESTINO,
-            F.FILIAL AS FILIAL,
-            FP.CAIXA AS CAIXA
-        FROM FATURAMENTO F
-        LEFT JOIN FATURAMENTO_PROD FP 
-            ON F.NF_SAIDA = FP.NF_SAIDA 
-            AND F.SERIE_NF = FP.SERIE_NF 
-            AND F.FILIAL = FP.FILIAL
+            F.FILIAL      AS FILIAL
+        FROM FATURAMENTO_PROD FP WITH (NOLOCK)
+        INNER JOIN FATURAMENTO F WITH (NOLOCK)
+            ON  F.NF_SAIDA = FP.NF_SAIDA
+            AND F.SERIE_NF = FP.SERIE_NF
+            AND F.FILIAL   = FP.FILIAL
         WHERE FP.CAIXA = :caixa
-        GROUP BY F.NOME_CLIFOR, F.FILIAL, FP.CAIXA
+        -- Se houver múltiplos, pegue o "mais recente" (ajuste se fizer sentido no seu ERP)
+        ORDER BY FP.NF_SAIDA DESC
     """)
 
     try:
@@ -189,6 +202,31 @@ def show_login():
                 else:
                     st.error("Preencha todos os campos.")
     st.stop()
+
+# ========= NOVO: util para parsear lista de romaneios =========
+def parse_romaneios(texto: str):
+    if not texto:
+        return []
+    # aceita separadores: vírgula, ponto e vírgula, quebra de linha, tab
+    raw = (
+        texto.replace(";", ",")
+        .replace("\n", ",")
+        .replace("\t", ",")
+        .replace(" ", "")
+    )
+    parts = [p for p in raw.split(",") if p]
+    ids = []
+    for p in parts:
+        if p.isdigit():
+            ids.append(int(p))
+    # remove duplicados preservando ordem
+    seen = set()
+    out = []
+    for i in ids:
+        if i not in seen:
+            out.append(i)
+            seen.add(i)
+    return out
 
 # --- 4. EXECUÇÃO DO APP ---
 if "auth" not in st.session_state:
@@ -315,7 +353,7 @@ else:
 
                     if st.button("✅ LIMPAR IMPRESSÃO (RESERVA)", key="btn_clear_print_reserva"):
                         del st.session_state["print_romaneio_id_reserva"]
-                        st.rerun()    
+                        st.rerun()
 
         # -------- CD PAVUNA --------
         elif st.session_state["unidade"] == "CD Pavuna":
@@ -336,68 +374,249 @@ else:
             if modo_pavuna == "📥 Recebimento (da Reserva)":
                 st.subheader("📥 Recebimento de Romaneios vindos do CD Reserva")
 
-                if "romaneio_pavuna" not in st.session_state:
-                    id_input = st.text_input("Digite o Nº do Romaneio (Reserva):", key="rom_reserva_input")
-                    if id_input and st.button("🔍 Abrir Romaneio para Recebimento", key="btn_abrir_rom_reserva"):
-                        check = (
-                            supabase.table("romaneios")
-                            .select("*")
-                            .eq("id", int(id_input))
-                            .eq("status", "Encerrado")
+                conferir_multiplos = st.toggle("Conferir múltiplos romaneios de uma vez", value=True)
+
+                # -------------------------
+                # MODO MULTI-ROMANEIO
+                # -------------------------
+                if conferir_multiplos:
+                    if "romaneios_pavuna_multi" not in st.session_state:
+                        st.session_state["romaneios_pavuna_multi"] = []
+                    if "map_chave_para_rom" not in st.session_state:
+                        st.session_state["map_chave_para_rom"] = {}
+                    if "conferidos_agora_multi" not in st.session_state:
+                        st.session_state["conferidos_agora_multi"] = set()
+                    if "totais_por_rom" not in st.session_state:
+                        st.session_state["totais_por_rom"] = {}
+
+                    if not st.session_state["romaneios_pavuna_multi"]:
+                        texto = st.text_area(
+                            "Cole os Nº dos Romaneios (Reserva) — separados por vírgula, ponto e vírgula ou linha:",
+                            key="rom_multi_input",
+                            height=120,
+                            placeholder="Ex:\n1234\n1235\n1236",
+                        )
+                        ids = parse_romaneios(texto)
+                        colA, colB = st.columns([1, 2])
+                        with colA:
+                            abrir = st.button("🔍 Carregar Romaneios", key="btn_carregar_multi")
+                        with colB:
+                            st.caption("Dica: você pode colar uma lista inteira do Whats/Excel; o app extrai só os números.")
+
+                        if abrir:
+                            if not ids:
+                                st.error("Informe ao menos 1 número de romaneio válido.")
+                                st.stop()
+
+                            # valida romaneios (encerrado + origem CD Reserva)
+                            roms = supabase.table("romaneios").select("id, status, unidade_origem").in_("id", ids).execute()
+                            encontrados = {r["id"]: r for r in (roms.data or [])}
+
+                            faltando = [i for i in ids if i not in encontrados]
+                            invalidos = []
+                            validos = []
+                            for i in ids:
+                                r = encontrados.get(i)
+                                if not r:
+                                    continue
+                                if r.get("status") != "Encerrado" or r.get("unidade_origem") != "CD Reserva":
+                                    invalidos.append(i)
+                                else:
+                                    validos.append(i)
+
+                            if faltando:
+                                st.warning(f"⚠️ Não encontrados no Supabase: {faltando}")
+                            if invalidos:
+                                st.error(f"❌ Inválidos (não encerrados ou não são da Reserva): {invalidos}")
+                            if not validos:
+                                st.error("Nenhum romaneio válido para conferência.")
+                                st.stop()
+
+                            # busca todas as chaves desses romaneios
+                            res_envio = (
+                                supabase.table("conferencia_reserva")
+                                .select("chave_nfe, romaneio_id")
+                                .in_("romaneio_id", validos)
+                                .execute()
+                            )
+
+                            map_chave = {}
+                            totais = {}
+                            for row in (res_envio.data or []):
+                                c = row.get("chave_nfe")
+                                rid = row.get("romaneio_id")
+                                if c:
+                                    map_chave[c] = rid
+                                    totais[rid] = totais.get(rid, 0) + 1
+
+                            if not map_chave:
+                                st.error("Não encontrei volumes em conferencia_reserva para esses romaneios.")
+                                st.stop()
+
+                            st.session_state["romaneios_pavuna_multi"] = validos
+                            st.session_state["map_chave_para_rom"] = map_chave
+                            st.session_state["totais_por_rom"] = totais
+                            st.session_state["conferidos_agora_multi"] = set()
+                            st.rerun()
+
+                    else:
+                        roms_multi = st.session_state["romaneios_pavuna_multi"]
+                        map_chave = st.session_state["map_chave_para_rom"]
+                        totais = st.session_state["totais_por_rom"]
+                        conferidos = st.session_state["conferidos_agora_multi"]
+
+                        st.info(f"✅ Conferindo múltiplos romaneios: **{', '.join(map(str, roms_multi))}**")
+
+                        def reg_pavuna_multi():
+                            chave = (st.session_state.get("input_pavuna_multi") or "").strip()
+                            if not chave:
+                                st.session_state["input_pavuna_multi"] = ""
+                                return
+
+                            rid = map_chave.get(chave)
+                            if not rid:
+                                st.error("❌ Volume não pertence a nenhum romaneio carregado!")
+                                st.session_state["input_pavuna_multi"] = ""
+                                return
+
+                            if chave in conferidos:
+                                st.warning("Já bipado nesta conferência.")
+                                st.session_state["input_pavuna_multi"] = ""
+                                return
+
+                            try:
+                                supabase.table("conferencia_reserva").update(
+                                    {"data_recebimento": get_now_br()}
+                                ).eq("chave_nfe", chave).eq("romaneio_id", int(rid)).execute()
+
+                                conferidos.add(chave)
+                                st.session_state["conferidos_agora_multi"] = conferidos
+                                st.toast(f"✅ Validado no romaneio #{rid}!")
+                            except Exception as e:
+                                st.error(f"Erro ao validar: {e}")
+
+                            st.session_state["input_pavuna_multi"] = ""
+
+                        st.text_input("Bipe a entrada (multi-romaneio):", key="input_pavuna_multi", on_change=reg_pavuna_multi)
+
+                        # progresso geral
+                        total_esperado = sum(totais.get(r, 0) for r in roms_multi)
+                        st.metric("Progresso Total", f"{len(conferidos)} / {total_esperado}")
+
+                        # progresso por romaneio (contagem a partir do que foi bipado agora)
+                        cont_por_rom = {r: 0 for r in roms_multi}
+                        for c in conferidos:
+                            rid = map_chave.get(c)
+                            if rid in cont_por_rom:
+                                cont_por_rom[rid] += 1
+
+                        df_prog = pd.DataFrame(
+                            [{
+                                "Romaneio": r,
+                                "Conferidos (agora)": cont_por_rom.get(r, 0),
+                                "Total esperado": totais.get(r, 0),
+                                "Faltam": max(totais.get(r, 0) - cont_por_rom.get(r, 0), 0)
+                            } for r in roms_multi]
+                        ).sort_values(["Faltam", "Romaneio"], ascending=[False, True])
+
+                        st.dataframe(df_prog, width="stretch")
+
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            if st.button("🏁 FINALIZAR CONFERÊNCIA (MULTI)", key="btn_finalizar_multi"):
+                                faltantes = []
+                                for r in roms_multi:
+                                    if cont_por_rom.get(r, 0) != totais.get(r, 0):
+                                        faltantes.append(r)
+
+                                if not faltantes:
+                                    st.success("✅ Todos os romaneios conferidos com sucesso!")
+                                    st.session_state["concluido_pavuna_multi"] = True
+                                else:
+                                    st.error(f"⚠️ Ainda há romaneios com faltas: {faltantes}")
+                        with c2:
+                            if st.button("🧹 LIMPAR / TROCAR ROMANEIOS", key="btn_clear_multi"):
+                                for k in [
+                                    "romaneios_pavuna_multi",
+                                    "map_chave_para_rom",
+                                    "conferidos_agora_multi",
+                                    "totais_por_rom",
+                                    "concluido_pavuna_multi",
+                                    "rom_multi_input",
+                                    "input_pavuna_multi",
+                                ]:
+                                    if k in st.session_state:
+                                        del st.session_state[k]
+                                st.rerun()
+
+                        if st.session_state.get("concluido_pavuna_multi"):
+                            st.success("Pronto! Você pode carregar novos romaneios quando quiser.")
+                # -------------------------
+                # MODO ÚNICO (antigo)
+                # -------------------------
+                else:
+                    if "romaneio_pavuna" not in st.session_state:
+                        id_input = st.text_input("Digite o Nº do Romaneio (Reserva):", key="rom_reserva_input")
+                        if id_input and st.button("🔍 Abrir Romaneio para Recebimento", key="btn_abrir_rom_reserva"):
+                            check = (
+                                supabase.table("romaneios")
+                                .select("*")
+                                .eq("id", int(id_input))
+                                .eq("status", "Encerrado")
+                                .execute()
+                            )
+                            if check.data and check.data[0].get("unidade_origem") == "CD Reserva":
+                                st.session_state["romaneio_pavuna"] = id_input
+                                st.session_state["conferidos_agora"] = []
+                                st.rerun()
+                            else:
+                                st.error("❌ Romaneio inválido, ainda aberto ou não é da Reserva.")
+                    else:
+                        rom_id = int(st.session_state["romaneio_pavuna"])
+                        st.info(f"✅ Conferindo Romaneio (Reserva): **#{rom_id}**")
+
+                        res_envio = (
+                            supabase.table("conferencia_reserva")
+                            .select("chave_nfe")
+                            .eq("romaneio_id", rom_id)
                             .execute()
                         )
-                        if check.data and check.data[0].get("unidade_origem") == "CD Reserva":
-                            st.session_state["romaneio_pavuna"] = id_input
-                            st.session_state["conferidos_agora"] = []
-                            st.rerun()
-                        else:
-                            st.error("❌ Romaneio inválido, ainda aberto ou não é da Reserva.")
-                else:
-                    rom_id = int(st.session_state["romaneio_pavuna"])
-                    st.info(f"✅ Conferindo Romaneio (Reserva): **#{rom_id}**")
+                        lista_esperada = [item["chave_nfe"] for item in res_envio.data]
 
-                    res_envio = (
-                        supabase.table("conferencia_reserva")
-                        .select("chave_nfe")
-                        .eq("romaneio_id", rom_id)
-                        .execute()
-                    )
-                    lista_esperada = [item["chave_nfe"] for item in res_envio.data]
-
-                    def reg_pavuna():
-                        chave = (st.session_state.get("input_pavuna") or "").strip()
-                        if chave:
-                            if chave in lista_esperada:
-                                if chave not in st.session_state["conferidos_agora"]:
-                                    supabase.table("conferencia_reserva").update(
-                                        {"data_recebimento": get_now_br()}
-                                    ).eq("chave_nfe", chave).eq("romaneio_id", rom_id).execute()
-                                    st.session_state["conferidos_agora"].append(chave)
-                                    st.toast("✅ Validado!")
+                        def reg_pavuna():
+                            chave = (st.session_state.get("input_pavuna") or "").strip()
+                            if chave:
+                                if chave in lista_esperada:
+                                    if chave not in st.session_state["conferidos_agora"]:
+                                        supabase.table("conferencia_reserva").update(
+                                            {"data_recebimento": get_now_br()}
+                                        ).eq("chave_nfe", chave).eq("romaneio_id", rom_id).execute()
+                                        st.session_state["conferidos_agora"].append(chave)
+                                        st.toast("✅ Validado!")
+                                    else:
+                                        st.warning("Já bipado.")
                                 else:
-                                    st.warning("Já bipado.")
+                                    st.error("Volume não pertence a este romaneio!")
+                                st.session_state["input_pavuna"] = ""
+
+                        st.text_input("Bipe a entrada:", key="input_pavuna", on_change=reg_pavuna)
+                        st.metric("Progresso", f"{len(st.session_state['conferidos_agora'])} / {len(lista_esperada)}")
+
+                        if st.button("🏁 FINALIZAR CONFERÊNCIA", key="btn_finalizar_rec"):
+                            faltas = [c for c in lista_esperada if c not in st.session_state["conferidos_agora"]]
+                            if not faltas:
+                                st.success("✅ Tudo conferido com sucesso!")
+                                st.session_state["concluido_pavuna"] = True
                             else:
-                                st.error("Volume não pertence a este romaneio!")
-                            st.session_state["input_pavuna"] = ""
+                                st.error(f"⚠️ Atenção! Faltam: {len(faltas)} volumes")
+                                st.table(pd.DataFrame(faltas, columns=["Chaves Faltantes"]))
 
-                    st.text_input("Bipe a entrada:", key="input_pavuna", on_change=reg_pavuna)
-                    st.metric("Progresso", f"{len(st.session_state['conferidos_agora'])} / {len(lista_esperada)}")
-
-                    if st.button("🏁 FINALIZAR CONFERÊNCIA", key="btn_finalizar_rec"):
-                        faltas = [c for c in lista_esperada if c not in st.session_state["conferidos_agora"]]
-                        if not faltas:
-                            st.success("✅ Tudo conferido com sucesso!")
-                            st.session_state["concluido_pavuna"] = True
-                        else:
-                            st.error(f"⚠️ Atenção! Faltam: {len(faltas)} volumes")
-                            st.table(pd.DataFrame(faltas, columns=["Chaves Faltantes"]))
-
-                    if st.session_state.get("concluido_pavuna"):
-                        if st.button("📦 PRÓXIMO ROMANEIO", type="primary", key="btn_proximo_rec"):
-                            del st.session_state["romaneio_pavuna"]
-                            del st.session_state["conferidos_agora"]
-                            del st.session_state["concluido_pavuna"]
-                            st.rerun()
+                        if st.session_state.get("concluido_pavuna"):
+                            if st.button("📦 PRÓXIMO ROMANEIO", type="primary", key="btn_proximo_rec"):
+                                del st.session_state["romaneio_pavuna"]
+                                del st.session_state["conferidos_agora"]
+                                del st.session_state["concluido_pavuna"]
+                                st.rerun()
 
             # ===== EXPEDIÇÃO =====
             else:
