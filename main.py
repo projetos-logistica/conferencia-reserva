@@ -1,6 +1,6 @@
 import streamlit as st
 from supabase import create_client
-from datetime import datetime
+from datetime import datetime, timezone
 import pytz
 import pandas as pd
 import base64
@@ -23,7 +23,6 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # --- 2. CONEXÃO SQL SERVER (SQLAlchemy) ---
 @st.cache_resource
-@st.cache_resource
 def get_sqlserver_engine():
     driver = st.secrets["SQLSERVER_DRIVER"]
     server = st.secrets["SQLSERVER_SERVER"]
@@ -40,8 +39,8 @@ def get_sqlserver_engine():
         f"PWD={pwd};"
         f"Encrypt={encrypt};"
         "TrustServerCertificate=yes;"
-        "Connection Timeout=20;"   # ✅ login timeout
-        "Timeout=30;"              # ✅ query timeout (driver-dependent)
+        "Connection Timeout=20;"
+        "LoginTimeout=20;"
     )
 
     params = urllib.parse.quote_plus(conn_str)
@@ -50,45 +49,30 @@ def get_sqlserver_engine():
         f"mssql+pyodbc:///?odbc_connect={params}",
         pool_pre_ping=True,
         pool_recycle=1800,
-        pool_timeout=30,     # ✅ espera por conexão do pool
-        connect_args={"timeout": 20},  # ✅ pyodbc login timeout
-    )
-
-    conn_str = (
-        f"DRIVER={{{driver}}};"
-        f"SERVER={server};"
-        f"DATABASE={database};"
-        f"UID={uid};"
-        f"PWD={pwd};"
-        f"Encrypt={encrypt};"
-        "TrustServerCertificate=yes;"
-    )
-
-    params = urllib.parse.quote_plus(conn_str)
-
-    # pool_pre_ping ajuda com conexões "mortas" e evita overhead de reconectar o tempo todo
-    return create_engine(
-        f"mssql+pyodbc:///?odbc_connect={params}",
-        pool_pre_ping=True,
-        pool_recycle=1800,
+        pool_timeout=30,
+        connect_args={"timeout": 20},
     )
 
 sql_engine = get_sqlserver_engine()
 
+# --- 2.1 COOLDOWN quando SQL estiver fora (evita travar operação) ---
 def sql_is_in_cooldown():
     until = st.session_state.get("sql_cooldown_until")
     if not until:
         return False
-    return datetime.utcnow() < until
+    return datetime.now(timezone.utc) < until
 
 def set_sql_cooldown(seconds=60):
-    st.session_state["sql_cooldown_until"] = datetime.utcnow() + pd.Timedelta(seconds=seconds)
+    st.session_state["sql_cooldown_until"] = datetime.now(timezone.utc) + pd.Timedelta(seconds=seconds)
 
 # --- 3. FUNÇÕES DE SUPORTE ---
-def get_now_br():
-    """Retorna o horário atual de Brasília formatado para o Supabase."""
-    fuso = pytz.timezone("America/Sao_Paulo")
-    return datetime.now(fuso).isoformat()
+def normalize_chave(value: str) -> str:
+    """Normaliza a chave/caixa para evitar divergência de maiúsculas/minúsculas."""
+    return (value or "").strip().upper()
+
+def get_now_utc():
+    """Grava sempre em UTC no banco (Supabase)."""
+    return datetime.now(timezone.utc).isoformat()
 
 def get_base64_of_bin_file(bin_file):
     if os.path.exists(bin_file):
@@ -106,13 +90,14 @@ def buscar_destino_sqlserver(caixa: str):
     - NOLOCK (opcional) para reduzir espera por locks no ERP.
     Cache 24h pra não martelar o ERP.
     """
+    caixa = normalize_chave(caixa)
     if not caixa:
         return None, None
 
-    # Importante:
-    # - Se "CAIXA" tiver índice, esse WHERE fica MUITO mais rápido.
-    # - TOP 1 evita varrer e agrupar desnecessariamente.
-    # - NOLOCK evita travar por lock (aceita risco de leitura suja).
+    # Se o SQL estiver instável, não tenta a cada bipagem
+    if sql_is_in_cooldown():
+        return None, None
+
     sql = text("""
         SELECT TOP 1
             F.NOME_CLIFOR AS DESTINO,
@@ -123,7 +108,6 @@ def buscar_destino_sqlserver(caixa: str):
             AND F.SERIE_NF = FP.SERIE_NF
             AND F.FILIAL   = FP.FILIAL
         WHERE FP.CAIXA = :caixa
-        -- Se houver múltiplos, pegue o "mais recente" (ajuste se fizer sentido no seu ERP)
         ORDER BY FP.NF_SAIDA DESC
     """)
 
@@ -136,7 +120,7 @@ def buscar_destino_sqlserver(caixa: str):
                 filial = str(filial) if filial is not None else None
                 return destino, filial
     except Exception as e:
-        # não derruba a operação por falha no ERP
+        set_sql_cooldown(60)
         st.warning(f"⚠️ Não consegui buscar DESTINO no SQL Server: {e}")
 
     return None, None
@@ -235,11 +219,10 @@ def show_login():
                     st.error("Preencha todos os campos.")
     st.stop()
 
-# ========= NOVO: util para parsear lista de romaneios =========
+# ========= util para parsear lista de romaneios =========
 def parse_romaneios(texto: str):
     if not texto:
         return []
-    # aceita separadores: vírgula, ponto e vírgula, quebra de linha, tab
     raw = (
         texto.replace(";", ",")
         .replace("\n", ",")
@@ -251,7 +234,6 @@ def parse_romaneios(texto: str):
     for p in parts:
         if p.isdigit():
             ids.append(int(p))
-    # remove duplicados preservando ordem
     seen = set()
     out = []
     for i in ids:
@@ -306,7 +288,7 @@ else:
                 st.metric(label="Volumes Bipados", value=total_bipado)
 
                 def reg_reserva():
-                    chave = (st.session_state.get("input_reserva") or "").strip()
+                    chave = normalize_chave(st.session_state.get("input_reserva"))
                     if not chave:
                         st.session_state["input_reserva"] = ""
                         return
@@ -334,7 +316,7 @@ else:
                         payload = {
                             "chave_nfe": chave,
                             "romaneio_id": id_atual,
-                            "data_expedicao": get_now_br(),
+                            "data_expedicao": get_now_utc(),
                         }
 
                         if destino:
@@ -353,10 +335,9 @@ else:
                 if st.button("🏁 ENCERRAR ROMANEIO", key="btn_fecha_rom_reserva"):
                     supabase.table("romaneios").update({
                         "status": "Encerrado",
-                        "data_encerramento": get_now_br()
+                        "data_encerramento": get_now_utc()
                     }).eq("id", id_atual).execute()
 
-                    # prepara impressão imediata
                     st.session_state["print_romaneio_id_reserva"] = id_atual
                     del st.session_state["romaneio_id"]
                     st.rerun()
@@ -391,7 +372,6 @@ else:
         elif st.session_state["unidade"] == "CD Pavuna":
             st.title("🏭 Operação CD PAVUNA")
 
-            # aplica troca de modo ANTES de criar o widget (evita StreamlitAPIException)
             if st.session_state.get("force_modo_pavuna"):
                 st.session_state["modo_pavuna"] = st.session_state.pop("force_modo_pavuna")
 
@@ -440,7 +420,6 @@ else:
                                 st.error("Informe ao menos 1 número de romaneio válido.")
                                 st.stop()
 
-                            # valida romaneios (encerrado + origem CD Reserva)
                             roms = supabase.table("romaneios").select("id, status, unidade_origem").in_("id", ids).execute()
                             encontrados = {r["id"]: r for r in (roms.data or [])}
 
@@ -464,22 +443,27 @@ else:
                                 st.error("Nenhum romaneio válido para conferência.")
                                 st.stop()
 
-                            # busca todas as chaves desses romaneios
+                            # ✅ Busca todas as chaves e também quem já tem data_recebimento (para não “perder” progresso)
                             res_envio = (
                                 supabase.table("conferencia_reserva")
-                                .select("chave_nfe, romaneio_id")
+                                .select("chave_nfe, romaneio_id, data_recebimento")
                                 .in_("romaneio_id", validos)
                                 .execute()
                             )
 
                             map_chave = {}
                             totais = {}
+                            conferidos_db = set()
+
                             for row in (res_envio.data or []):
-                                c = row.get("chave_nfe")
+                                c = normalize_chave(row.get("chave_nfe"))
                                 rid = row.get("romaneio_id")
-                                if c:
+                                dr = row.get("data_recebimento")
+                                if c and rid:
                                     map_chave[c] = rid
                                     totais[rid] = totais.get(rid, 0) + 1
+                                    if dr:  # já recebido antes
+                                        conferidos_db.add(c)
 
                             if not map_chave:
                                 st.error("Não encontrei volumes em conferencia_reserva para esses romaneios.")
@@ -488,7 +472,7 @@ else:
                             st.session_state["romaneios_pavuna_multi"] = validos
                             st.session_state["map_chave_para_rom"] = map_chave
                             st.session_state["totais_por_rom"] = totais
-                            st.session_state["conferidos_agora_multi"] = set()
+                            st.session_state["conferidos_agora_multi"] = conferidos_db
                             st.rerun()
 
                     else:
@@ -500,7 +484,7 @@ else:
                         st.info(f"✅ Conferindo múltiplos romaneios: **{', '.join(map(str, roms_multi))}**")
 
                         def reg_pavuna_multi():
-                            chave = (st.session_state.get("input_pavuna_multi") or "").strip()
+                            chave = normalize_chave(st.session_state.get("input_pavuna_multi"))
                             if not chave:
                                 st.session_state["input_pavuna_multi"] = ""
                                 return
@@ -512,13 +496,13 @@ else:
                                 return
 
                             if chave in conferidos:
-                                st.warning("Já bipado nesta conferência.")
+                                st.warning("Já bipado (já consta como recebido).")
                                 st.session_state["input_pavuna_multi"] = ""
                                 return
 
                             try:
                                 supabase.table("conferencia_reserva").update(
-                                    {"data_recebimento": get_now_br()}
+                                    {"data_recebimento": get_now_utc()}
                                 ).eq("chave_nfe", chave).eq("romaneio_id", int(rid)).execute()
 
                                 conferidos.add(chave)
@@ -531,11 +515,9 @@ else:
 
                         st.text_input("Bipe a entrada (multi-romaneio):", key="input_pavuna_multi", on_change=reg_pavuna_multi)
 
-                        # progresso geral
                         total_esperado = sum(totais.get(r, 0) for r in roms_multi)
                         st.metric("Progresso Total", f"{len(conferidos)} / {total_esperado}")
 
-                        # progresso por romaneio (contagem a partir do que foi bipado agora)
                         cont_por_rom = {r: 0 for r in roms_multi}
                         for c in conferidos:
                             rid = map_chave.get(c)
@@ -545,7 +527,7 @@ else:
                         df_prog = pd.DataFrame(
                             [{
                                 "Romaneio": r,
-                                "Conferidos (agora)": cont_por_rom.get(r, 0),
+                                "Conferidos": cont_por_rom.get(r, 0),
                                 "Total esperado": totais.get(r, 0),
                                 "Faltam": max(totais.get(r, 0) - cont_por_rom.get(r, 0), 0)
                             } for r in roms_multi]
@@ -568,6 +550,7 @@ else:
                                     st.error(f"⚠️ Ainda há romaneios com faltas: {faltantes}")
                         with c2:
                             if st.button("🧹 LIMPAR / TROCAR ROMANEIOS", key="btn_clear_multi"):
+                                # ✅ NÃO apaga nada do banco, só limpa a seleção atual
                                 for k in [
                                     "romaneios_pavuna_multi",
                                     "map_chave_para_rom",
@@ -583,6 +566,7 @@ else:
 
                         if st.session_state.get("concluido_pavuna_multi"):
                             st.success("Pronto! Você pode carregar novos romaneios quando quiser.")
+
                 # -------------------------
                 # MODO ÚNICO (antigo)
                 # -------------------------
@@ -599,7 +583,6 @@ else:
                             )
                             if check.data and check.data[0].get("unidade_origem") == "CD Reserva":
                                 st.session_state["romaneio_pavuna"] = id_input
-                                st.session_state["conferidos_agora"] = []
                                 st.rerun()
                             else:
                                 st.error("❌ Romaneio inválido, ainda aberto ou não é da Reserva.")
@@ -609,33 +592,39 @@ else:
 
                         res_envio = (
                             supabase.table("conferencia_reserva")
-                            .select("chave_nfe")
+                            .select("chave_nfe, data_recebimento")
                             .eq("romaneio_id", rom_id)
                             .execute()
                         )
-                        lista_esperada = [item["chave_nfe"] for item in res_envio.data]
+
+                        lista_esperada = [normalize_chave(item.get("chave_nfe")) for item in (res_envio.data or [])]
+                        conferidos_db = {normalize_chave(item.get("chave_nfe")) for item in (res_envio.data or []) if item.get("data_recebimento")}
 
                         def reg_pavuna():
-                            chave = (st.session_state.get("input_pavuna") or "").strip()
-                            if chave:
-                                if chave in lista_esperada:
-                                    if chave not in st.session_state["conferidos_agora"]:
-                                        supabase.table("conferencia_reserva").update(
-                                            {"data_recebimento": get_now_br()}
-                                        ).eq("chave_nfe", chave).eq("romaneio_id", rom_id).execute()
-                                        st.session_state["conferidos_agora"].append(chave)
-                                        st.toast("✅ Validado!")
-                                    else:
-                                        st.warning("Já bipado.")
-                                else:
-                                    st.error("Volume não pertence a este romaneio!")
+                            chave = normalize_chave(st.session_state.get("input_pavuna"))
+                            if not chave:
                                 st.session_state["input_pavuna"] = ""
+                                return
+
+                            if chave in lista_esperada:
+                                if chave in conferidos_db:
+                                    st.warning("Já consta como recebido.")
+                                else:
+                                    supabase.table("conferencia_reserva").update(
+                                        {"data_recebimento": get_now_utc()}
+                                    ).eq("chave_nfe", chave).eq("romaneio_id", rom_id).execute()
+                                    conferidos_db.add(chave)
+                                    st.toast("✅ Validado!")
+                            else:
+                                st.error("Volume não pertence a este romaneio!")
+
+                            st.session_state["input_pavuna"] = ""
 
                         st.text_input("Bipe a entrada:", key="input_pavuna", on_change=reg_pavuna)
-                        st.metric("Progresso", f"{len(st.session_state['conferidos_agora'])} / {len(lista_esperada)}")
+                        st.metric("Progresso", f"{len(conferidos_db)} / {len(lista_esperada)}")
 
                         if st.button("🏁 FINALIZAR CONFERÊNCIA", key="btn_finalizar_rec"):
-                            faltas = [c for c in lista_esperada if c not in st.session_state["conferidos_agora"]]
+                            faltas = [c for c in lista_esperada if c not in conferidos_db]
                             if not faltas:
                                 st.success("✅ Tudo conferido com sucesso!")
                                 st.session_state["concluido_pavuna"] = True
@@ -645,16 +634,15 @@ else:
 
                         if st.session_state.get("concluido_pavuna"):
                             if st.button("📦 PRÓXIMO ROMANEIO", type="primary", key="btn_proximo_rec"):
-                                del st.session_state["romaneio_pavuna"]
-                                del st.session_state["conferidos_agora"]
-                                del st.session_state["concluido_pavuna"]
+                                for k in ["romaneio_pavuna", "concluido_pavuna", "input_pavuna", "rom_reserva_input"]:
+                                    if k in st.session_state:
+                                        del st.session_state[k]
                                 st.rerun()
 
             # ===== EXPEDIÇÃO =====
             else:
                 st.subheader("🚛 Expedição - CD Pavuna (Gerar Romaneio de Saída)")
 
-                # ✅ Após encerrar, já mostra botão de imprimir
                 if st.session_state.get("print_romaneio_id"):
                     rid = int(st.session_state["print_romaneio_id"])
                     st.success(f"✅ Romaneio #{rid} encerrado.")
@@ -708,12 +696,11 @@ else:
                     st.metric(label="Volumes Bipados", value=total_bipado)
 
                     def reg_pavuna_saida():
-                        chave = (st.session_state.get("input_pavuna_saida") or "").strip()
+                        chave = normalize_chave(st.session_state.get("input_pavuna_saida"))
                         if not chave:
                             st.session_state["input_pavuna_saida"] = ""
                             return
 
-                        # mantém expedição selecionada (via flag)
                         st.session_state["force_modo_pavuna"] = "🚛 Expedição CD Pavuna"
 
                         try:
@@ -735,10 +722,9 @@ else:
                             payload = {
                                 "chave_nfe": chave,
                                 "romaneio_id": id_atual,
-                                "data_expedicao": get_now_br(),
+                                "data_expedicao": get_now_utc(),
                             }
 
-                            # prioridade: destino digitado na tela; se vazio, usa o do SQL Server
                             if destino_padrao.strip():
                                 payload["destino"] = destino_padrao.strip()
                             elif destino_db:
@@ -760,7 +746,7 @@ else:
 
                     if st.button("🏁 ENCERRAR ROMANEIO (PAVUNA)", key="btn_fecha_rom_pavuna"):
                         supabase.table("romaneios").update(
-                            {"status": "Encerrado", "data_encerramento": get_now_br()}
+                            {"status": "Encerrado", "data_encerramento": get_now_utc()}
                         ).eq("id", id_atual).execute()
 
                         st.session_state["print_romaneio_id"] = id_atual
@@ -795,16 +781,13 @@ else:
             if res.data:
                 df = pd.json_normalize(res.data)
 
-                # Conversão de datas
+                # ✅ Conversão de datas: SEMPRE interpretando como UTC e convertendo para SP
                 cols_data = ["data_expedicao", "data_recebimento", "romaneios.data_encerramento"]
                 for col in cols_data:
                     if col in df.columns and df[col].notnull().any():
-                        df[col] = pd.to_datetime(df[col])
-                        if df[col].dt.tz is None:
-                            df[col] = df[col].dt.tz_localize("UTC")
-                        df[col] = df[col].dt.tz_convert("America/Sao_Paulo").dt.strftime("%d/%m/%Y %H:%M:%S")
+                        dt = pd.to_datetime(df[col], utc=True, errors="coerce")
+                        df[col] = dt.dt.tz_convert("America/Sao_Paulo").dt.strftime("%d/%m/%Y %H:%M:%S")
 
-                # ✅ Ordenar por romaneio e depois por destino (crescente)
                 sort_cols = []
                 if "romaneio_id" in df.columns:
                     sort_cols.append("romaneio_id")
@@ -821,7 +804,6 @@ else:
                 if f_rom and f_rom.isdigit():
                     st.divider()
                     if st.button("📥 Reimprimir Romaneio"):
-                        # ✅ Busca dados completos do romaneio para imprimir (inclui destino)
                         rid = int(f_rom)
                         rr = (
                             supabase.table("conferencia_reserva")
