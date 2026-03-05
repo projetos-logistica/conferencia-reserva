@@ -1,3 +1,4 @@
+import re
 import streamlit as st
 from supabase import create_client
 from datetime import datetime, timezone
@@ -46,6 +47,45 @@ def get_base64_of_bin_file(bin_file):
 def buscar_destino_sqlserver(caixa: str):
     return None, None
 
+# -------------------------------------------------------------------
+# ✅ NOVO: Extrair 1+ caixas do input (corrige "duas caixas coladas")
+# -------------------------------------------------------------------
+CAIXA_PATTERN = re.compile(r"[A-Z]\d{7,}")  # Ex.: F2830233 (F + 7+ dígitos)
+
+def extrair_caixas(raw: str) -> list[str]:
+    """
+    Extrai caixas do texto digitado/bipado.
+    Suporta:
+      - Separadores (espaço, vírgula, quebra de linha, etc.)
+      - Concatenação sem separador: F2830233F2830222
+    """
+    raw = normalize_chave(raw)
+    if not raw:
+        return []
+
+    # 1) tenta achar por regex (pega inclusive colado)
+    achadas = CAIXA_PATTERN.findall(raw)
+    if achadas:
+        # remove duplicatas mantendo ordem
+        seen = set()
+        out = []
+        for c in achadas:
+            if c not in seen:
+                out.append(c)
+                seen.add(c)
+        return out
+
+    # 2) fallback: split por não-alfanumérico
+    parts = re.split(r"[^A-Z0-9]+", raw)
+    parts = [p for p in parts if p]
+    seen = set()
+    out = []
+    for p in parts:
+        if p not in seen:
+            out.append(p)
+            seen.add(p)
+    return out
+
 def imprimir_romaneio_html(id_romaneio, df_volumes, usuario, origem):
     agora_br = datetime.now(FUSO_SP).strftime("%d/%m/%Y %H:%M")
 
@@ -59,10 +99,18 @@ def imprimir_romaneio_html(id_romaneio, df_volumes, usuario, origem):
     df_print["chave_nfe"] = df_print["chave_nfe"].fillna("").astype(str)
     df_print = df_print.sort_values(by=["destino", "chave_nfe"], ascending=[True, True])
 
+    qtd_volumes = len(df_print)
+
     html_print = f"""
     <div id="printarea" style="font-family: sans-serif; padding: 20px;">
         <h2 style="text-align: center; border-bottom: 2px solid #000;">ROMANEIO DE EXPEDIÇÃO - AZZAS</h2>
-        <p><strong>Nº Romaneio:</strong> {id_romaneio} | <strong>Origem:</strong> {origem}</p>
+
+        <p>
+          <strong>Nº Romaneio:</strong> {id_romaneio} |
+          <strong>Origem:</strong> {origem} |
+          <strong>Qtd. Volumes:</strong> {qtd_volumes}
+        </p>
+
         <p><strong>Usuário Responsável:</strong> {usuario}</p>
         <p><strong>Data de Emissão:</strong> {agora_br}</p>
 
@@ -83,6 +131,8 @@ def imprimir_romaneio_html(id_romaneio, df_volumes, usuario, origem):
                 ])}
             </tbody>
         </table>
+
+        <p style="margin-top: 10px;"><strong>Total de volumes:</strong> {qtd_volumes}</p>
 
         <div style="margin-top: 60px; text-align: center;">
             <p>___________________________________________________</p>
@@ -211,7 +261,6 @@ else:
 
             if "romaneio_id" not in st.session_state:
                 if st.button("🚀 ABRIR NOVO ROMANEIO"):
-                    # ✅ NÃO manda data_criacao (coluna não existe)
                     res = supabase.table("romaneios").insert(
                         {
                             "usuario_criou": st.session_state["user_email"],
@@ -236,54 +285,60 @@ else:
                 st.metric(label="Volumes Bipados", value=total_bipado)
 
                 def reg_reserva():
-                    chave = normalize_chave(st.session_state.get("input_reserva"))
-                    if not chave:
-                        st.session_state["input_reserva"] = ""
-                        return
-                    if len(chave) < 4:
-                        st.warning("Chave muito curta. Verifique a bipagem.")
-                        st.session_state["input_reserva"] = ""
-                        return
+                    raw = st.session_state.get("input_reserva")
+                    caixas = extrair_caixas(raw)
 
-                    try:
-                        dup = (
-                            supabase.table("conferencia_reserva")
-                            .select("id")
-                            .eq("romaneio_id", id_atual)
-                            .eq("chave_nfe", chave)
-                            .limit(1)
-                            .execute()
-                        )
-                        if dup.data:
-                            st.warning("⚠️ Este volume já foi bipado neste romaneio.")
-                            st.session_state["input_reserva"] = ""
-                            return
-
-                        destino, filial = buscar_destino_sqlserver(chave)
-
-                        payload = {
-                            "chave_nfe": chave,
-                            "romaneio_id": id_atual,
-                            "data_expedicao": get_now_utc(),
-                        }
-
-                        if destino:
-                            payload["destino"] = f"{destino} ({filial})" if filial else destino
-
-                        supabase.table("conferencia_reserva").insert(payload).execute()
-                        st.toast(f"✅ Bipado: {chave[-10:]}")
-
-                    except Exception as e:
-                        st.error(f"Erro ao registrar: {e}")
-
+                    # limpa input o quanto antes (evita concatenar no rerun)
                     st.session_state["input_reserva"] = ""
+
+                    if not caixas:
+                        return
+
+                    if len(caixas) > 1:
+                        st.warning(f"⚠️ Foram detectadas {len(caixas)} caixas no mesmo input. Vou registrar separadamente.")
+
+                    # registra cada caixa separadamente
+                    for chave in caixas:
+                        if len(chave) < 4:
+                            st.warning(f"Chave muito curta ignorada: {chave}")
+                            continue
+
+                        try:
+                            dup = (
+                                supabase.table("conferencia_reserva")
+                                .select("id")
+                                .eq("romaneio_id", id_atual)
+                                .eq("chave_nfe", chave)
+                                .limit(1)
+                                .execute()
+                            )
+                            if dup.data:
+                                st.warning(f"⚠️ Já bipado neste romaneio: {chave}")
+                                continue
+
+                            destino, filial = buscar_destino_sqlserver(chave)
+
+                            payload = {
+                                "chave_nfe": chave,
+                                "romaneio_id": id_atual,
+                                "data_expedicao": get_now_utc(),
+                            }
+
+                            if destino:
+                                payload["destino"] = f"{destino} ({filial})" if filial else destino
+
+                            supabase.table("conferencia_reserva").insert(payload).execute()
+                            st.toast(f"✅ Bipado: {chave[-10:]}")
+
+                        except Exception as e:
+                            st.error(f"Erro ao registrar {chave}: {e}")
 
                 st.text_input("Bipe os volumes:", key="input_reserva", on_change=reg_reserva)
 
                 if st.button("🏁 ENCERRAR ROMANEIO", key="btn_fecha_rom_reserva"):
                     supabase.table("romaneios").update({
                         "status": "Encerrado",
-                        "data_encerramento": get_now_utc(),  # mantém UTC
+                        "data_encerramento": get_now_utc(),
                     }).eq("id", id_atual).execute()
 
                     st.session_state["print_romaneio_id_reserva"] = id_atual
@@ -310,6 +365,9 @@ else:
 
                 conferir_multiplos = st.toggle("Conferir múltiplos romaneios de uma vez", value=True)
 
+                # -------------------------
+                # MODO MULTI
+                # -------------------------
                 if conferir_multiplos:
                     if "romaneios_pavuna_multi" not in st.session_state:
                         st.session_state["romaneios_pavuna_multi"] = []
@@ -332,7 +390,7 @@ else:
                         with colA:
                             abrir = st.button("🔍 Carregar Romaneios", key="btn_carregar_multi")
                         with colB:
-                            st.caption("Dica: você pode colar uma lista inteira do Whats/Excel; o app extrai só os números.")
+                            st.caption("Dica: cole uma lista; o app extrai só os números.")
 
                         if abrir:
                             if not ids:
@@ -402,38 +460,41 @@ else:
                         st.info(f"✅ Conferindo múltiplos romaneios: **{', '.join(map(str, roms_multi))}**")
 
                         def reg_pavuna_multi():
-                            chave = normalize_chave(st.session_state.get("input_pavuna_multi"))
-                            if not chave:
-                                st.session_state["input_pavuna_multi"] = ""
-                                return
-
-                            rid = map_chave.get(chave)
-                            if not rid:
-                                st.error("❌ Volume não pertence a nenhum romaneio carregado!")
-                                st.session_state["input_pavuna_multi"] = ""
-                                return
-
-                            if chave in conferidos:
-                                st.warning("Já bipado (já consta como recebido).")
-                                st.session_state["input_pavuna_multi"] = ""
-                                return
-
-                            try:
-                                supabase.table("conferencia_reserva").update(
-                                    {"data_recebimento": get_now_utc()}
-                                ).eq("chave_nfe", chave).eq("romaneio_id", int(rid)).execute()
-
-                                conferidos.add(chave)
-                                st.session_state["conferidos_agora_multi"] = conferidos
-                                st.toast(f"✅ Validado no romaneio #{rid}!")
-                            except Exception as e:
-                                st.error(f"Erro ao validar: {e}")
-
+                            raw = st.session_state.get("input_pavuna_multi")
+                            caixas = extrair_caixas(raw)
                             st.session_state["input_pavuna_multi"] = ""
+
+                            if not caixas:
+                                return
+                            if len(caixas) > 1:
+                                st.warning(f"⚠️ Detectei {len(caixas)} caixas no mesmo input. Vou validar separadamente.")
+
+                            for chave in caixas:
+                                rid = map_chave.get(chave)
+                                if not rid:
+                                    st.error(f"❌ Volume não pertence aos romaneios carregados: {chave}")
+                                    continue
+
+                                if chave in conferidos:
+                                    st.warning(f"Já bipado (já consta como recebido): {chave}")
+                                    continue
+
+                                try:
+                                    supabase.table("conferencia_reserva").update(
+                                        {"data_recebimento": get_now_utc()}
+                                    ).eq("chave_nfe", chave).eq("romaneio_id", int(rid)).execute()
+
+                                    conferidos.add(chave)
+                                    st.session_state["conferidos_agora_multi"] = conferidos
+                                    st.toast(f"✅ Validado {chave} no romaneio #{rid}!")
+
+                                except Exception as e:
+                                    st.error(f"Erro ao validar {chave}: {e}")
 
                         st.text_input("Bipe a entrada (multi-romaneio):", key="input_pavuna_multi", on_change=reg_pavuna_multi)
 
                         total_esperado = sum(totais.get(r, 0) for r in roms_multi)
+                        st.metric("Qtd volumes (TOTAL esperada)", total_esperado)
                         st.metric("Progresso Total", f"{len(conferidos)} / {total_esperado}")
 
                         cont_por_rom = {r: 0 for r in roms_multi}
@@ -445,8 +506,8 @@ else:
                         df_prog = pd.DataFrame(
                             [{
                                 "Romaneio": r,
-                                "Conferidos": cont_por_rom.get(r, 0),
-                                "Total esperado": totais.get(r, 0),
+                                "Qtd esperada": totais.get(r, 0),
+                                "Qtd conferida": cont_por_rom.get(r, 0),
                                 "Faltam": max(totais.get(r, 0) - cont_por_rom.get(r, 0), 0)
                             } for r in roms_multi]
                         ).sort_values(["Faltam", "Romaneio"], ascending=[False, True])
@@ -484,6 +545,103 @@ else:
                         if st.session_state.get("concluido_pavuna_multi"):
                             st.success("Pronto! Você pode carregar novos romaneios quando quiser.")
 
+                # -------------------------
+                # MODO SINGLE (NOVO)
+                # -------------------------
+                else:
+                    st.caption("Modo simples: abrir 1 romaneio por vez, com quantidade esperada.")
+
+                    if "romaneio_pavuna_single" not in st.session_state:
+                        id_input = st.text_input("Digite o Nº do Romaneio (Reserva):", key="rom_single_input")
+                        if id_input and st.button("🔍 Abrir Romaneio", key="btn_abrir_single"):
+                            check = supabase.table("romaneios") \
+                                .select("*") \
+                                .eq("id", int(id_input)) \
+                                .eq("status", "Encerrado") \
+                                .execute()
+                            if check.data and check.data[0].get("unidade_origem") == "CD Reserva":
+                                st.session_state["romaneio_pavuna_single"] = int(id_input)
+                                st.session_state["conferidos_single"] = set()
+                                st.rerun()
+                            else:
+                                st.error("❌ Romaneio inválido, ainda aberto ou não é da Reserva.")
+                    else:
+                        rom_id = int(st.session_state["romaneio_pavuna_single"])
+                        st.info(f"✅ Conferindo Romaneio (Reserva): **#{rom_id}**")
+
+                        # quantidade esperada
+                        res_count = supabase.table("conferencia_reserva") \
+                            .select("id", count="exact") \
+                            .eq("romaneio_id", rom_id) \
+                            .execute()
+                        total_esperado = res_count.count if res_count.count else 0
+
+                        # lista esperada para validação
+                        res_envio = supabase.table("conferencia_reserva") \
+                            .select("chave_nfe, data_recebimento") \
+                            .eq("romaneio_id", rom_id) \
+                            .execute()
+
+                        lista_esperada = [normalize_chave(x.get("chave_nfe")) for x in (res_envio.data or [])]
+                        recebidos_db = set([normalize_chave(x.get("chave_nfe")) for x in (res_envio.data or []) if x.get("data_recebimento")])
+
+                        # inicializa com os já recebidos no banco
+                        conferidos = st.session_state.get("conferidos_single", set())
+                        conferidos |= recebidos_db
+                        st.session_state["conferidos_single"] = conferidos
+
+                        st.metric("Qtd volumes (esperada)", total_esperado)
+                        st.metric("Qtd conferida", len(conferidos))
+                        st.metric("Faltam", max(total_esperado - len(conferidos), 0))
+
+                        def reg_pavuna_single():
+                            raw = st.session_state.get("input_pavuna_single")
+                            caixas = extrair_caixas(raw)
+                            st.session_state["input_pavuna_single"] = ""
+
+                            if not caixas:
+                                return
+                            if len(caixas) > 1:
+                                st.warning(f"⚠️ Detectei {len(caixas)} caixas no mesmo input. Vou validar separadamente.")
+
+                            for chave in caixas:
+                                if chave not in lista_esperada:
+                                    st.error(f"❌ Volume não pertence a este romaneio: {chave}")
+                                    continue
+                                if chave in conferidos:
+                                    st.warning(f"Já bipado: {chave}")
+                                    continue
+
+                                try:
+                                    supabase.table("conferencia_reserva") \
+                                        .update({"data_recebimento": get_now_utc()}) \
+                                        .eq("chave_nfe", chave) \
+                                        .eq("romaneio_id", rom_id) \
+                                        .execute()
+
+                                    conferidos.add(chave)
+                                    st.session_state["conferidos_single"] = conferidos
+                                    st.toast(f"✅ Validado: {chave}")
+
+                                except Exception as e:
+                                    st.error(f"Erro ao validar {chave}: {e}")
+
+                        st.text_input("Bipe a entrada:", key="input_pavuna_single", on_change=reg_pavuna_single)
+
+                        if st.button("🏁 FINALIZAR CONFERÊNCIA", key="btn_finalizar_single"):
+                            faltas = [c for c in lista_esperada if c not in conferidos]
+                            if not faltas:
+                                st.success("✅ Tudo conferido com sucesso!")
+                            else:
+                                st.error(f"⚠️ Atenção! Faltam: {len(faltas)} volumes")
+                                st.table(pd.DataFrame(faltas, columns=["Chaves Faltantes"]))
+
+                        if st.button("📦 PRÓXIMO ROMANEIO", type="primary", key="btn_next_single"):
+                            for k in ["romaneio_pavuna_single", "conferidos_single", "rom_single_input", "input_pavuna_single"]:
+                                if k in st.session_state:
+                                    del st.session_state[k]
+                            st.rerun()
+
             # ===== EXPEDIÇÃO =====
             else:
                 st.subheader("🚛 Expedição - CD Pavuna (Gerar Romaneio de Saída)")
@@ -518,7 +676,6 @@ else:
 
                 if "romaneio_id_pavuna_saida" not in st.session_state:
                     if st.button("🚀 ABRIR NOVO ROMANEIO (PAVUNA)", key="btn_abre_rom_pavuna"):
-                        # ✅ não manda data_criacao
                         res = supabase.table("romaneios").insert(
                             {
                                 "usuario_criou": st.session_state["user_email"],
@@ -542,47 +699,49 @@ else:
                     st.metric(label="Volumes Bipados", value=total_bipado)
 
                     def reg_pavuna_saida():
-                        chave = normalize_chave(st.session_state.get("input_pavuna_saida"))
-                        if not chave:
-                            st.session_state["input_pavuna_saida"] = ""
+                        raw = st.session_state.get("input_pavuna_saida")
+                        caixas = extrair_caixas(raw)
+                        st.session_state["input_pavuna_saida"] = ""
+
+                        if not caixas:
                             return
+                        if len(caixas) > 1:
+                            st.warning(f"⚠️ Detectei {len(caixas)} caixas no mesmo input. Vou registrar separadamente.")
 
                         st.session_state["force_modo_pavuna"] = "🚛 Expedição CD Pavuna"
 
-                        try:
-                            dup = (
-                                supabase.table("conferencia_reserva")
-                                .select("id")
-                                .eq("romaneio_id", id_atual)
-                                .eq("chave_nfe", chave)
-                                .limit(1)
-                                .execute()
-                            )
-                            if dup.data:
-                                st.warning("⚠️ Este volume já foi bipado neste romaneio.")
-                                st.session_state["input_pavuna_saida"] = ""
-                                return
+                        for chave in caixas:
+                            try:
+                                dup = (
+                                    supabase.table("conferencia_reserva")
+                                    .select("id")
+                                    .eq("romaneio_id", id_atual)
+                                    .eq("chave_nfe", chave)
+                                    .limit(1)
+                                    .execute()
+                                )
+                                if dup.data:
+                                    st.warning(f"⚠️ Já bipado neste romaneio: {chave}")
+                                    continue
 
-                            destino_db, filial_db = buscar_destino_sqlserver(chave)
+                                destino_db, filial_db = buscar_destino_sqlserver(chave)
 
-                            payload = {
-                                "chave_nfe": chave,
-                                "romaneio_id": id_atual,
-                                "data_expedicao": get_now_utc(),
-                            }
+                                payload = {
+                                    "chave_nfe": chave,
+                                    "romaneio_id": id_atual,
+                                    "data_expedicao": get_now_utc(),
+                                }
 
-                            if destino_padrao.strip():
-                                payload["destino"] = destino_padrao.strip()
-                            elif destino_db:
-                                payload["destino"] = f"{destino_db} ({filial_db})" if filial_db else destino_db
+                                if destino_padrao.strip():
+                                    payload["destino"] = destino_padrao.strip()
+                                elif destino_db:
+                                    payload["destino"] = f"{destino_db} ({filial_db})" if filial_db else destino_db
 
-                            supabase.table("conferencia_reserva").insert(payload).execute()
-                            st.toast(f"✅ Bipado: {chave[-10:]}")
+                                supabase.table("conferencia_reserva").insert(payload).execute()
+                                st.toast(f"✅ Bipado: {chave[-10:]}")
 
-                        except Exception as e:
-                            st.error(f"Erro ao registrar: {e}")
-
-                        st.session_state["input_pavuna_saida"] = ""
+                            except Exception as e:
+                                st.error(f"Erro ao registrar {chave}: {e}")
 
                     st.text_input(
                         "Bipe os volumes (saída Pavuna):",
@@ -627,12 +786,11 @@ else:
             if res.data:
                 df = pd.json_normalize(res.data)
 
-                # ✅ Converte datas sempre UTC -> São Paulo para exibição correta
                 cols_data = [
                     "data_expedicao",
                     "data_recebimento",
-                    "romaneios.created_at",          # ✅ padrão do Supabase
-                    "romaneios.data_encerramento",   # se existir
+                    "romaneios.created_at",
+                    "romaneios.data_encerramento",
                 ]
                 for col in cols_data:
                     if col in df.columns and df[col].notnull().any():
