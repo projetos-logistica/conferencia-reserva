@@ -8,9 +8,8 @@ import base64
 import os
 
 # -------------------------------------------------------------------
-# ✅ SQL SERVER DESATIVADO (para Streamlit Cloud)
+# APP CONFIG
 # -------------------------------------------------------------------
-
 st.set_page_config(page_title="Gestão Reserva - AZZAS", layout="wide")
 
 # --- 1. CONFIGURAÇÕES E CONEXÃO (SUPABASE) ---
@@ -41,32 +40,50 @@ def get_base64_of_bin_file(bin_file):
     return ""
 
 # -------------------------------------------------------------------
-# ✅ STUB: Buscar destino via SQL Server (DESATIVADO)
+# ✅ NOVO: Buscar DESTINO pela CAIXA na tabela SUPABASE "faturamento"
 # -------------------------------------------------------------------
-@st.cache_data(ttl=24 * 3600, show_spinner=False)
-def buscar_destino_sqlserver(caixa: str):
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def buscar_destino_por_caixa(caixa: str):
+    """
+    Busca destino (e filial_origem) na tabela public.faturamento (Supabase)
+    Estrutura esperada: caixa, filial_origem, destino, qtde_pecas, created_at
+    Retorna: (destino, filial_origem)
+    """
+    caixa = normalize_chave(caixa)
+    if not caixa:
+        return None, None
+
+    try:
+        res = (
+            supabase.table("faturamento")
+            .select("destino, filial_origem")
+            .eq("caixa", caixa)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if res.data:
+            destino = res.data[0].get("destino")
+            filial_origem = res.data[0].get("filial_origem")
+            return destino, filial_origem
+    except Exception as e:
+        st.warning(f"⚠️ Falha ao buscar destino no faturamento: {e}")
+
     return None, None
 
 # -------------------------------------------------------------------
-# ✅ NOVO: Extrair 1+ caixas do input (corrige "duas caixas coladas")
+# ✅ Extrair 1+ caixas do input (corrige "duas caixas coladas")
+#   - Ex.: F2830233F2830222 -> F2830233 e F2830222
 # -------------------------------------------------------------------
-CAIXA_PATTERN = re.compile(r"[A-Z]\d{7,}")  # Ex.: F2830233 (F + 7+ dígitos)
+CAIXA_PATTERN = re.compile(r"[A-Z]\d{7,}")
 
 def extrair_caixas(raw: str) -> list[str]:
-    """
-    Extrai caixas do texto digitado/bipado.
-    Suporta:
-      - Separadores (espaço, vírgula, quebra de linha, etc.)
-      - Concatenação sem separador: F2830233F2830222
-    """
     raw = normalize_chave(raw)
     if not raw:
         return []
 
-    # 1) tenta achar por regex (pega inclusive colado)
     achadas = CAIXA_PATTERN.findall(raw)
     if achadas:
-        # remove duplicatas mantendo ordem
         seen = set()
         out = []
         for c in achadas:
@@ -75,7 +92,6 @@ def extrair_caixas(raw: str) -> list[str]:
                 seen.add(c)
         return out
 
-    # 2) fallback: split por não-alfanumérico
     parts = re.split(r"[^A-Z0-9]+", raw)
     parts = [p for p in parts if p]
     seen = set()
@@ -235,11 +251,13 @@ else:
                 colp1, colp2 = st.columns([1, 1])
                 with colp1:
                     if st.button("🖨️ IMPRIMIR ROMANEIO (RESERVA)", type="primary", key="btn_print_reserva"):
-                        rr = supabase.table("conferencia_reserva") \
-                            .select("chave_nfe, destino, romaneios(usuario_criou, unidade_origem)") \
-                            .eq("romaneio_id", rid) \
-                            .order("id", desc=False) \
+                        rr = (
+                            supabase.table("conferencia_reserva")
+                            .select("chave_nfe, destino, romaneios(usuario_criou, unidade_origem)")
+                            .eq("romaneio_id", rid)
+                            .order("id", desc=False)
                             .execute()
+                        )
 
                         if rr.data:
                             df_print = pd.DataFrame([
@@ -297,7 +315,6 @@ else:
                     if len(caixas) > 1:
                         st.warning(f"⚠️ Foram detectadas {len(caixas)} caixas no mesmo input. Vou registrar separadamente.")
 
-                    # registra cada caixa separadamente
                     for chave in caixas:
                         if len(chave) < 4:
                             st.warning(f"Chave muito curta ignorada: {chave}")
@@ -316,7 +333,8 @@ else:
                                 st.warning(f"⚠️ Já bipado neste romaneio: {chave}")
                                 continue
 
-                            destino, filial = buscar_destino_sqlserver(chave)
+                            # ✅ DESTINO via tabela faturamento
+                            destino, filial_origem = buscar_destino_por_caixa(chave)
 
                             payload = {
                                 "chave_nfe": chave,
@@ -325,7 +343,7 @@ else:
                             }
 
                             if destino:
-                                payload["destino"] = f"{destino} ({filial})" if filial else destino
+                                payload["destino"] = destino
 
                             supabase.table("conferencia_reserva").insert(payload).execute()
                             st.toast(f"✅ Bipado: {chave[-10:]}")
@@ -546,7 +564,7 @@ else:
                             st.success("Pronto! Você pode carregar novos romaneios quando quiser.")
 
                 # -------------------------
-                # MODO SINGLE (NOVO)
+                # MODO SINGLE
                 # -------------------------
                 else:
                     st.caption("Modo simples: abrir 1 romaneio por vez, com quantidade esperada.")
@@ -569,14 +587,12 @@ else:
                         rom_id = int(st.session_state["romaneio_pavuna_single"])
                         st.info(f"✅ Conferindo Romaneio (Reserva): **#{rom_id}**")
 
-                        # quantidade esperada
                         res_count = supabase.table("conferencia_reserva") \
                             .select("id", count="exact") \
                             .eq("romaneio_id", rom_id) \
                             .execute()
                         total_esperado = res_count.count if res_count.count else 0
 
-                        # lista esperada para validação
                         res_envio = supabase.table("conferencia_reserva") \
                             .select("chave_nfe, data_recebimento") \
                             .eq("romaneio_id", rom_id) \
@@ -585,7 +601,6 @@ else:
                         lista_esperada = [normalize_chave(x.get("chave_nfe")) for x in (res_envio.data or [])]
                         recebidos_db = set([normalize_chave(x.get("chave_nfe")) for x in (res_envio.data or []) if x.get("data_recebimento")])
 
-                        # inicializa com os já recebidos no banco
                         conferidos = st.session_state.get("conferidos_single", set())
                         conferidos |= recebidos_db
                         st.session_state["conferidos_single"] = conferidos
@@ -724,7 +739,8 @@ else:
                                     st.warning(f"⚠️ Já bipado neste romaneio: {chave}")
                                     continue
 
-                                destino_db, filial_db = buscar_destino_sqlserver(chave)
+                                # se não digitar destino, tenta buscar no faturamento
+                                destino_db, _filial = buscar_destino_por_caixa(chave)
 
                                 payload = {
                                     "chave_nfe": chave,
@@ -735,7 +751,7 @@ else:
                                 if destino_padrao.strip():
                                     payload["destino"] = destino_padrao.strip()
                                 elif destino_db:
-                                    payload["destino"] = f"{destino_db} ({filial_db})" if filial_db else destino_db
+                                    payload["destino"] = destino_db
 
                                 supabase.table("conferencia_reserva").insert(payload).execute()
                                 st.toast(f"✅ Bipado: {chave[-10:]}")
