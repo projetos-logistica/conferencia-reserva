@@ -39,6 +39,23 @@ def get_now_utc() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def format_datetime_sp(value):
+    """
+    Converte datetime/string ISO para o fuso de São Paulo
+    e retorna no formato dd/mm/aaaa HH:MM:SS.
+    """
+    if value is None or value == "":
+        return ""
+
+    try:
+        dt = pd.to_datetime(value, errors="coerce", utc=True)
+        if pd.isna(dt):
+            return ""
+        return dt.tz_convert("America/Sao_Paulo").strftime("%d/%m/%Y %H:%M:%S")
+    except Exception:
+        return str(value)
+
+
 def get_base64_of_bin_file(bin_file: str) -> str:
     if os.path.exists(bin_file):
         with open(bin_file, "rb") as f:
@@ -75,6 +92,7 @@ def parse_romaneios(texto: str) -> list[int]:
 # CAIXAS: extrair múltiplas em um input (ex.: F2830233F2830222)
 # =========================================================
 CAIXA_PATTERN = re.compile(r"[A-Z]\d{7,}")  # Ex.: F2830233
+
 
 def extrair_caixas(raw: str) -> list[str]:
     raw = normalize_chave(raw)
@@ -186,14 +204,19 @@ def imprimir_romaneio_html(id_romaneio, df_volumes, usuario, origem):
     agora_br = datetime.now(FUSO_SP).strftime("%d/%m/%Y %H:%M")
 
     df_print = df_volumes.copy()
+
+    if "caixa" not in df_print.columns:
+        if "chave_nfe" in df_print.columns:
+            df_print["caixa"] = df_print["chave_nfe"]
+        else:
+            df_print["caixa"] = ""
+
     if "destino" not in df_print.columns:
         df_print["destino"] = ""
-    if "chave_nfe" not in df_print.columns:
-        df_print["chave_nfe"] = ""
 
+    df_print["caixa"] = df_print["caixa"].fillna("").astype(str)
     df_print["destino"] = df_print["destino"].fillna("").astype(str)
-    df_print["chave_nfe"] = df_print["chave_nfe"].fillna("").astype(str)
-    df_print = df_print.sort_values(by=["destino", "chave_nfe"], ascending=[True, True])
+    df_print = df_print.sort_values(by=["destino", "caixa"], ascending=[True, True])
 
     qtd_volumes = len(df_print)
 
@@ -213,14 +236,14 @@ def imprimir_romaneio_html(id_romaneio, df_volumes, usuario, origem):
         <table style="width: 100%; border-collapse: collapse; margin-top: 15px;">
             <thead>
                 <tr style="background: #eee;">
-                    <th style="border: 1px solid #000; padding: 8px; text-align: left; width: 35%;">Caixa</th>
+                    <th style="border: 1px solid #000; padding: 8px; text-align: left; width: 35%;">CAIXA</th>
                     <th style="border: 1px solid #000; padding: 8px; text-align: left;">Destino</th>
                 </tr>
             </thead>
             <tbody>
                 {"".join([
                     f"<tr>"
-                    f"<td style='border: 1px solid #000; padding: 8px;'>{r.get('chave_nfe','')}</td>"
+                    f"<td style='border: 1px solid #000; padding: 8px;'>{r.get('caixa','')}</td>"
                     f"<td style='border: 1px solid #000; padding: 8px;'>{r.get('destino','')}</td>"
                     f"</tr>"
                     for _, r in df_print.iterrows()
@@ -401,7 +424,7 @@ with tab_op:
                     )
                     if rr.data:
                         df_print = pd.DataFrame([
-                            {"chave_nfe": x.get("chave_nfe", ""), "destino": x.get("destino", "")}
+                            {"caixa": x.get("chave_nfe", ""), "destino": x.get("destino", "")}
                             for x in rr.data
                         ])
                         usuario = rr.data[0]["romaneios"].get("usuario_criou", "")
@@ -471,7 +494,6 @@ with tab_op:
                             st.warning(f"⚠️ Já bipado neste romaneio: {chave}")
                             continue
 
-                        # destino via tabela faturamento (se existir)
                         destino, _filial_origem = buscar_destino_por_caixa(chave)
 
                         payload = {
@@ -795,10 +817,6 @@ with tab_op:
 
         # =========================
         # EXPEDIÇÃO CD PAVUNA (ROMANEIO ESPELHO)
-        #   - seleciona 1+ romaneios recebidos
-        #   - puxa SOMENTE caixas com data_recebimento preenchida
-        #   - enriquece via tabela faturamento (batch)
-        #   - grava em romaneios_espelho / romaneio_espelho_itens
         # =========================
         else:
             st.subheader("🚛 Expedição CD Pavuna - Romaneio Espelho (somente recebido)")
@@ -827,7 +845,6 @@ with tab_op:
                     st.error("Informe ao menos 1 romaneio válido.")
                     st.stop()
 
-                # valida romaneios: encerrado + origem Reserva
                 roms = supabase.table("romaneios").select("id, status, unidade_origem").in_("id", ids).execute()
                 encontrados = {r["id"]: r for r in (roms.data or [])}
 
@@ -848,7 +865,6 @@ with tab_op:
                 if not validos:
                     st.stop()
 
-                # pega caixas dos romaneios e filtra apenas recebidas
                 res = (
                     supabase.table("conferencia_reserva")
                     .select("chave_nfe, romaneio_id, data_recebimento")
@@ -938,7 +954,6 @@ with tab_op:
                 st.session_state["print_rom_espelho_id"] = rom_id
                 st.success(f"✅ Romaneio espelho #{rom_id} finalizado.")
 
-            # imprimir
             if st.session_state.get("print_rom_espelho_id"):
                 rid = int(st.session_state["print_rom_espelho_id"])
                 if st.button("🖨️ IMPRIMIR ROMANEIO ESPELHO", type="primary", key="btn_print_espelho"):
@@ -983,15 +998,19 @@ with tab_base:
             df = pd.json_normalize(res.data)
 
             cols_data = [
+                "created_at",
+                "criado_em",
                 "data_expedicao",
                 "data_recebimento",
+                "data_encerramento",
                 "romaneios.created_at",
+                "romaneios.criado_em",
                 "romaneios.data_encerramento",
             ]
+
             for col in cols_data:
-                if col in df.columns and df[col].notnull().any():
-                    dt = pd.to_datetime(df[col], utc=True, errors="coerce")
-                    df[col] = dt.dt.tz_convert("America/Sao_Paulo").dt.strftime("%d/%m/%Y %H:%M:%S")
+                if col in df.columns:
+                    df[col] = df[col].apply(format_datetime_sp)
 
             sort_cols = []
             if "romaneio_id" in df.columns:
@@ -1002,6 +1021,23 @@ with tab_base:
                 sort_cols.append("chave_nfe")
             if sort_cols:
                 df = df.sort_values(sort_cols, ascending=True)
+
+            rename_map = {
+                "romaneio_id": "Romaneio",
+                "chave_nfe": "CAIXA",
+                "destino": "Destino",
+                "data_expedicao": "Data Expedição",
+                "data_recebimento": "Data Recebimento",
+                "created_at": "Criado em",
+                "criado_em": "Criado em",
+                "data_encerramento": "Data Encerramento",
+                "romaneios.usuario_criou": "Usuário",
+                "romaneios.unidade_origem": "Unidade Origem",
+                "romaneios.created_at": "Romaneio Criado em",
+                "romaneios.criado_em": "Romaneio Criado em",
+                "romaneios.data_encerramento": "Romaneio Encerrado em",
+            }
+            df = df.rename(columns=rename_map)
 
             st.dataframe(df, width="stretch")
 
@@ -1019,7 +1055,7 @@ with tab_base:
 
                     if rr.data:
                         df_print = pd.DataFrame(
-                            [{"chave_nfe": x.get("chave_nfe", ""), "destino": x.get("destino", "")} for x in rr.data]
+                            [{"caixa": x.get("chave_nfe", ""), "destino": x.get("destino", "")} for x in rr.data]
                         )
                         usuario = rr.data[0]["romaneios"].get("usuario_criou", "")
                         origem = rr.data[0]["romaneios"].get("unidade_origem", "")
