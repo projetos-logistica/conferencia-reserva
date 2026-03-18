@@ -1,7 +1,7 @@
 import re
 import streamlit as st
 from supabase import create_client
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta, time
 import pytz
 import pandas as pd
 import base64
@@ -189,12 +189,53 @@ def buscar_faturamento_batch(caixas: list[str]) -> pd.DataFrame:
 
     df = df.drop_duplicates(subset=["caixa"], keep="first")
 
+    for col, default in {
+        "caixa": "",
+        "filial_origem": "",
+        "destino": "",
+        "qtde_pecas": 0,
+    }.items():
+        if col not in df.columns:
+            df[col] = default
+
     df["caixa"] = df["caixa"].fillna("").astype(str).str.upper().str.strip()
-    df["filial_origem"] = df.get("filial_origem", "").fillna("").astype(str)
-    df["destino"] = df.get("destino", "").fillna("").astype(str)
-    df["qtde_pecas"] = pd.to_numeric(df.get("qtde_pecas", 0), errors="coerce").fillna(0).astype(int)
+    df["filial_origem"] = df["filial_origem"].fillna("").astype(str)
+    df["destino"] = df["destino"].fillna("").astype(str)
+    df["qtde_pecas"] = pd.to_numeric(df["qtde_pecas"], errors="coerce").fillna(0).astype(int)
 
     return df[["caixa", "filial_origem", "destino", "qtde_pecas"]]
+
+
+@st.cache_data(ttl=30 * 60, show_spinner=False)
+def buscar_caixas_ja_expedidas(caixas: list[str]) -> pd.DataFrame:
+    """
+    Consulta romaneio_espelho_itens e retorna caixas que já foram expedidas.
+    Espera colunas: caixa, romaneio_espelho_id
+    """
+    caixas = [normalize_chave(c) for c in caixas if normalize_chave(c)]
+    caixas = list(dict.fromkeys(caixas))
+
+    if not caixas:
+        return pd.DataFrame(columns=["caixa", "romaneio_espelho_id"])
+
+    dfs = []
+    for part in chunk_list(caixas, size=500):
+        res = (
+            supabase.table("romaneio_espelho_itens")
+            .select("caixa, romaneio_espelho_id")
+            .in_("caixa", part)
+            .execute()
+        )
+        if res.data:
+            dfs.append(pd.DataFrame(res.data))
+
+    if not dfs:
+        return pd.DataFrame(columns=["caixa", "romaneio_espelho_id"])
+
+    df = pd.concat(dfs, ignore_index=True)
+    df["caixa"] = df["caixa"].fillna("").astype(str).str.upper().str.strip()
+    df = df.drop_duplicates(subset=["caixa"], keep="first")
+    return df[["caixa", "romaneio_espelho_id"]]
 
 
 # =========================================================
@@ -273,7 +314,7 @@ def imprimir_romaneio_html(id_romaneio, df_volumes, usuario, origem):
 # =========================================================
 # IMPRESSÃO - ROMANEIO ESPELHO PAVUNA (colunas completas)
 # =========================================================
-def imprimir_romaneio_espelho_html(id_romaneio, usuario, origem, df_itens: pd.DataFrame):
+def imprimir_romaneio_espelho_html(id_romaneio, usuario, origem, df_itens: pd.DataFrame, rota=""):
     agora_br = datetime.now(FUSO_SP).strftime("%d/%m/%Y %H:%M")
 
     df = df_itens.copy()
@@ -298,6 +339,7 @@ def imprimir_romaneio_espelho_html(id_romaneio, usuario, origem, df_itens: pd.Da
       <p>
         <strong>Nº Romaneio:</strong> {id_romaneio} |
         <strong>Origem:</strong> {origem} |
+        <strong>Rota:</strong> {rota} |
         <strong>Qtd. Caixas:</strong> {qtd_caixas} |
         <strong>Qtd. Peças:</strong> {total_pecas}
       </p>
@@ -552,7 +594,7 @@ with tab_op:
                 if "map_chave_para_rom" not in st.session_state:
                     st.session_state["map_chave_para_rom"] = {}
                 if "conferidos_agora_multi" not in st.session_state:
-                    st.session_state["conferidos_agora_multi"] = set()
+                    st.session_state["conferidos_agora_multi"] = []
                 if "totais_por_rom" not in st.session_state:
                     st.session_state["totais_por_rom"] = {}
 
@@ -614,6 +656,9 @@ with tab_op:
                             rid = row.get("romaneio_id")
                             dr = row.get("data_recebimento")
                             if c and rid:
+                                if c in map_chave and map_chave[c] != rid:
+                                    st.error(f"Caixa duplicada em romaneios diferentes: {c}")
+                                    st.stop()
                                 map_chave[c] = rid
                                 totais[rid] = totais.get(rid, 0) + 1
                                 if dr:
@@ -626,14 +671,14 @@ with tab_op:
                         st.session_state["romaneios_pavuna_multi"] = validos
                         st.session_state["map_chave_para_rom"] = map_chave
                         st.session_state["totais_por_rom"] = totais
-                        st.session_state["conferidos_agora_multi"] = conferidos_db
+                        st.session_state["conferidos_agora_multi"] = list(conferidos_db)
                         st.rerun()
 
                 else:
                     roms_multi = st.session_state["romaneios_pavuna_multi"]
                     map_chave = st.session_state["map_chave_para_rom"]
                     totais = st.session_state["totais_por_rom"]
-                    conferidos = st.session_state["conferidos_agora_multi"]
+                    conferidos = set(st.session_state.get("conferidos_agora_multi", []))
 
                     st.info(f"✅ Conferindo múltiplos romaneios: **{', '.join(map(str, roms_multi))}**")
 
@@ -663,7 +708,7 @@ with tab_op:
                                 ).eq("chave_nfe", chave).eq("romaneio_id", int(rid)).execute()
 
                                 conferidos.add(chave)
-                                st.session_state["conferidos_agora_multi"] = conferidos
+                                st.session_state["conferidos_agora_multi"] = list(conferidos)
                                 st.toast(f"✅ Validado {chave} no romaneio #{rid}!")
 
                             except Exception as e:
@@ -686,7 +731,7 @@ with tab_op:
                             "Romaneio": r,
                             "Qtd esperada": totais.get(r, 0),
                             "Qtd conferida": cont_por_rom.get(r, 0),
-                            "Faltam": max(totais.get(r, 0) - cont_por_rom.get(r, 0), 0)
+                            "Faltam": max(totais.get(r) - cont_por_rom.get(r, 0), 0)
                         } for r in roms_multi]
                     ).sort_values(["Faltam", "Romaneio"], ascending=[False, True])
 
@@ -730,14 +775,20 @@ with tab_op:
                 if "romaneio_pavuna_single" not in st.session_state:
                     id_input = st.text_input("Digite o Nº do Romaneio (Reserva):", key="rom_single_input")
                     if id_input and st.button("🔍 Abrir Romaneio", key="btn_abrir_single"):
-                        check = supabase.table("romaneios") \
-                            .select("*") \
-                            .eq("id", int(id_input)) \
-                            .eq("status", "Encerrado") \
+                        if not id_input.isdigit():
+                            st.error("Digite um número de romaneio válido.")
+                            st.stop()
+
+                        check = (
+                            supabase.table("romaneios")
+                            .select("*")
+                            .eq("id", int(id_input))
+                            .eq("status", "Encerrado")
                             .execute()
+                        )
                         if check.data and check.data[0].get("unidade_origem") == "CD Reserva":
                             st.session_state["romaneio_pavuna_single"] = int(id_input)
-                            st.session_state["conferidos_single"] = set()
+                            st.session_state["conferidos_single"] = []
                             st.rerun()
                         else:
                             st.error("❌ Romaneio inválido, ainda aberto ou não é da Reserva.")
@@ -759,9 +810,9 @@ with tab_op:
                     lista_esperada = [normalize_chave(x.get("chave_nfe")) for x in (res_envio.data or [])]
                     recebidos_db = set([normalize_chave(x.get("chave_nfe")) for x in (res_envio.data or []) if x.get("data_recebimento")])
 
-                    conferidos = st.session_state.get("conferidos_single", set())
+                    conferidos = set(st.session_state.get("conferidos_single", []))
                     conferidos |= recebidos_db
-                    st.session_state["conferidos_single"] = conferidos
+                    st.session_state["conferidos_single"] = list(conferidos)
 
                     st.metric("Qtd volumes (esperada)", total_esperado)
                     st.metric("Qtd conferida", len(conferidos))
@@ -793,7 +844,7 @@ with tab_op:
                                     .execute()
 
                                 conferidos.add(chave)
-                                st.session_state["conferidos_single"] = conferidos
+                                st.session_state["conferidos_single"] = list(conferidos)
                                 st.toast(f"✅ Validado: {chave}")
 
                             except Exception as e:
@@ -821,10 +872,16 @@ with tab_op:
         else:
             st.subheader("🚛 Expedição CD Pavuna - Romaneio Espelho (somente recebido)")
 
+            if "espelho_df_full" not in st.session_state:
+                st.session_state["espelho_df_full"] = pd.DataFrame(
+                    columns=["selecionar", "caixa", "filial_origem", "destino", "qtde_pecas", "ja_expedida", "romaneio_espelho_existente"]
+                )
             if "espelho_df" not in st.session_state:
                 st.session_state["espelho_df"] = pd.DataFrame(columns=["caixa", "filial_origem", "destino", "qtde_pecas"])
             if "roms_origem_espelho" not in st.session_state:
                 st.session_state["roms_origem_espelho"] = []
+            if "rota_espelho" not in st.session_state:
+                st.session_state["rota_espelho"] = ""
 
             texto_roms = st.text_area(
                 "Cole os Nº dos Romaneios (Reserva) — pode selecionar mais de 1 (linha/vírgula):",
@@ -837,7 +894,7 @@ with tab_op:
             with colA:
                 btn_add = st.button("➕ Adicionar Romaneios", key="btn_add_roms_espelho")
             with colB:
-                st.caption("O app puxa SOMENTE caixas recebidas (data_recebimento preenchida) e busca filial/destino/qtde no faturamento.")
+                st.caption("O app puxa SOMENTE caixas recebidas, bloqueia caixas já expedidas e permite selecionar apenas as desejadas.")
 
             if btn_add:
                 ids = parse_romaneios(texto_roms)
@@ -892,23 +949,111 @@ with tab_op:
                 df_itens["destino"] = df_itens["destino"].fillna("")
                 df_itens["qtde_pecas"] = pd.to_numeric(df_itens["qtde_pecas"], errors="coerce").fillna(0).astype(int)
 
-                st.session_state["espelho_df"] = df_itens
+                # Bloqueio de caixas já expedidas em romaneio espelho anterior
+                df_expedidas = buscar_caixas_ja_expedidas(caixas)
+
+                if not df_expedidas.empty:
+                    df_itens = df_itens.merge(
+                        df_expedidas.rename(columns={"romaneio_espelho_id": "romaneio_espelho_existente"}),
+                        on="caixa",
+                        how="left"
+                    )
+                else:
+                    df_itens["romaneio_espelho_existente"] = pd.NA
+
+                df_itens["ja_expedida"] = df_itens["romaneio_espelho_existente"].notna()
+                df_itens["selecionar"] = ~df_itens["ja_expedida"]
+
+                st.session_state["espelho_df_full"] = df_itens[
+                    ["selecionar", "caixa", "filial_origem", "destino", "qtde_pecas", "ja_expedida", "romaneio_espelho_existente"]
+                ].copy()
+
                 st.session_state["roms_origem_espelho"] = validos
+                st.session_state["espelho_df"] = df_itens.loc[
+                    ~df_itens["ja_expedida"],
+                    ["caixa", "filial_origem", "destino", "qtde_pecas"]
+                ].copy()
+
+                qtd_bloqueadas = int(df_itens["ja_expedida"].sum())
+                if qtd_bloqueadas > 0:
+                    st.warning(f"⚠️ {qtd_bloqueadas} caixa(s) já haviam sido expedidas em romaneio espelho anterior e foram bloqueadas.")
                 st.success(f"✅ {len(caixas)} caixas recebidas carregadas de {len(validos)} romaneios.")
 
-            df_itens = st.session_state.get("espelho_df")
+            df_full = st.session_state.get("espelho_df_full", pd.DataFrame())
+            tem_dados = isinstance(df_full, pd.DataFrame) and len(df_full) > 0
+
+            if tem_dados:
+                st.divider()
+                csel1, csel2 = st.columns([1, 1])
+
+                with csel1:
+                    if st.button("✅ Selecionar todas disponíveis", key="btn_sel_all_espelho"):
+                        df_full.loc[~df_full["ja_expedida"], "selecionar"] = True
+                        st.session_state["espelho_df_full"] = df_full
+                        st.rerun()
+
+                with csel2:
+                    if st.button("🚫 Limpar seleção", key="btn_unsel_all_espelho"):
+                        df_full["selecionar"] = False
+                        st.session_state["espelho_df_full"] = df_full
+                        st.rerun()
+
+                st.write("### Seleção de caixas para expedição")
+                st.caption("Caixas já expedidas anteriormente ficam bloqueadas e não podem ser selecionadas.")
+
+                df_view = df_full.copy()
+                df_view["status"] = df_view.apply(
+                    lambda r: f"Já expedida no espelho #{int(r['romaneio_espelho_existente'])}" if r["ja_expedida"] else "Disponível",
+                    axis=1
+                )
+
+                edited_df = st.data_editor(
+                    df_view[["selecionar", "caixa", "filial_origem", "destino", "qtde_pecas", "status"]],
+                    hide_index=True,
+                    width="stretch",
+                    disabled=["caixa", "filial_origem", "destino", "qtde_pecas", "status"],
+                    column_config={
+                        "selecionar": st.column_config.CheckboxColumn("Selecionar"),
+                        "caixa": "Caixa",
+                        "filial_origem": "Filial Origem",
+                        "destino": "Destino",
+                        "qtde_pecas": "Qtde Peças",
+                        "status": "Status",
+                    },
+                    key="editor_espelho"
+                )
+
+                df_full["selecionar"] = edited_df["selecionar"].astype(bool)
+                df_full.loc[df_full["ja_expedida"], "selecionar"] = False
+                st.session_state["espelho_df_full"] = df_full
+
+                df_selecionado = df_full.loc[
+                    (df_full["selecionar"]) & (~df_full["ja_expedida"]),
+                    ["caixa", "filial_origem", "destino", "qtde_pecas"]
+                ].copy()
+
+                st.session_state["espelho_df"] = df_selecionado
+
+            df_itens = st.session_state.get("espelho_df", pd.DataFrame())
             qtd_caixas = len(df_itens) if isinstance(df_itens, pd.DataFrame) else 0
             total_pecas = int(df_itens["qtde_pecas"].sum()) if isinstance(df_itens, pd.DataFrame) and "qtde_pecas" in df_itens.columns else 0
 
+            st.divider()
+            st.text_input(
+                "Rota",
+                key="rota_espelho",
+                placeholder="Ex.: ROTA 01, ROTA 02, ROTA 100"
+            )
+
             cM1, cM2, cM3 = st.columns(3)
-            cM1.metric("Qtd. Caixas", qtd_caixas)
+            cM1.metric("Qtd. Caixas Selecionadas", qtd_caixas)
             cM2.metric("Qtd. Peças", total_pecas)
             cM3.metric("Romaneios origem", len(st.session_state.get("roms_origem_espelho", [])))
 
             if isinstance(df_itens, pd.DataFrame) and len(df_itens):
                 st.dataframe(df_itens.sort_values(["destino", "caixa"], ascending=[True, True]), width="stretch")
             else:
-                st.info("Nenhum romaneio carregado ainda para o espelho.")
+                st.info("Nenhuma caixa selecionada ainda para o romaneio espelho.")
 
             colF1, colF2, colF3 = st.columns([1, 1, 2])
             with colF1:
@@ -917,14 +1062,28 @@ with tab_op:
                 btn_limpar = st.button("🧹 Limpar", key="btn_limpar_espelho")
 
             if btn_limpar:
-                for k in ["espelho_df", "roms_origem_espelho", "print_rom_espelho_id"]:
+                for k in ["espelho_df", "espelho_df_full", "roms_origem_espelho", "print_rom_espelho_id", "rota_espelho"]:
                     if k in st.session_state:
                         del st.session_state[k]
                 st.rerun()
 
             if btn_finalizar:
                 if not isinstance(df_itens, pd.DataFrame) or len(df_itens) == 0:
-                    st.error("Sem caixas para finalizar.")
+                    st.error("Selecione ao menos 1 caixa para finalizar.")
+                    st.stop()
+
+                rota = (st.session_state.get("rota_espelho") or "").strip().upper()
+                if not rota:
+                    st.error("Informe a rota antes de finalizar.")
+                    st.stop()
+
+                # Revalidação no banco para evitar duplicidade entre usuários
+                caixas_final = df_itens["caixa"].fillna("").astype(str).str.upper().str.strip().tolist()
+                df_expedidas_now = buscar_caixas_ja_expedidas(caixas_final)
+
+                if not df_expedidas_now.empty:
+                    caixas_bloqueadas = df_expedidas_now["caixa"].tolist()
+                    st.error(f"❌ Estas caixas já foram expedidas anteriormente e não podem seguir: {caixas_bloqueadas}")
                     st.stop()
 
                 usuario = st.session_state["user_email"]
@@ -935,6 +1094,7 @@ with tab_op:
                     "status": "Encerrado",
                     "romaneios_origem": st.session_state.get("roms_origem_espelho", []),
                     "qtd_caixas": int(len(df_itens)),
+                    "rota": rota,
                 }).execute()
 
                 rom_id = res_rom.data[0]["id"]
@@ -952,7 +1112,7 @@ with tab_op:
                 supabase.table("romaneio_espelho_itens").insert(itens_payload).execute()
 
                 st.session_state["print_rom_espelho_id"] = rom_id
-                st.success(f"✅ Romaneio espelho #{rom_id} finalizado.")
+                st.success(f"✅ Romaneio espelho #{rom_id} finalizado na rota {rota}.")
 
             if st.session_state.get("print_rom_espelho_id"):
                 rid = int(st.session_state["print_rom_espelho_id"])
@@ -961,10 +1121,11 @@ with tab_op:
                         id_romaneio=rid,
                         usuario=st.session_state["user_email"],
                         origem="CD Pavuna",
+                        rota=st.session_state.get("rota_espelho", ""),
                         df_itens=st.session_state["espelho_df"],
                     )
                 if st.button("✅ OK / NOVO", key="btn_ok_novo_espelho"):
-                    for k in ["espelho_df", "roms_origem_espelho", "print_rom_espelho_id", "roms_espelho_input"]:
+                    for k in ["espelho_df", "espelho_df_full", "roms_origem_espelho", "print_rom_espelho_id", "roms_espelho_input", "rota_espelho"]:
                         if k in st.session_state:
                             del st.session_state[k]
                     st.rerun()
@@ -988,9 +1149,11 @@ with tab_base:
         if f_rom and f_rom.isdigit():
             q = q.eq("romaneio_id", int(f_rom))
         if dt_ini:
-            q = q.gte("data_expedicao", dt_ini.strftime("%Y-%m-%d"))
+            dt_ini_full = datetime.combine(dt_ini, time.min).strftime("%Y-%m-%dT%H:%M:%S")
+            q = q.gte("data_expedicao", dt_ini_full)
         if dt_fim:
-            q = q.lte("data_expedicao", dt_fim.strftime("%Y-%m-%d"))
+            dt_fim_full = datetime.combine(dt_fim + timedelta(days=1), time.min).strftime("%Y-%m-%dT%H:%M:%S")
+            q = q.lt("data_expedicao", dt_fim_full)
 
         res = q.order("data_expedicao", desc=True).execute()
 
