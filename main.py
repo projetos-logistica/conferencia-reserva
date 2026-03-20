@@ -312,18 +312,18 @@ def imprimir_romaneio_html(id_romaneio, df_volumes, usuario, origem):
 
 
 # =========================================================
-# IMPRESSÃO - ROMANEIO ESPELHO PAVUNA (colunas completas)
+# IMPRESSÃO - ROMANEIO ESPELHO PAVUNA
+# colunas: caixa + destino + qtde_pecas
 # =========================================================
 def imprimir_romaneio_espelho_html(id_romaneio, usuario, origem, df_itens: pd.DataFrame, rota=""):
     agora_br = datetime.now(FUSO_SP).strftime("%d/%m/%Y %H:%M")
 
     df = df_itens.copy()
-    for col in ["caixa", "filial_origem", "destino", "qtde_pecas"]:
+    for col in ["caixa", "destino", "qtde_pecas"]:
         if col not in df.columns:
             df[col] = "" if col != "qtde_pecas" else 0
 
     df["caixa"] = df["caixa"].fillna("").astype(str)
-    df["filial_origem"] = df["filial_origem"].fillna("").astype(str)
     df["destino"] = df["destino"].fillna("").astype(str)
     df["qtde_pecas"] = pd.to_numeric(df["qtde_pecas"], errors="coerce").fillna(0).astype(int)
 
@@ -350,17 +350,15 @@ def imprimir_romaneio_espelho_html(id_romaneio, usuario, origem, df_itens: pd.Da
       <table style="width:100%;border-collapse:collapse;margin-top:15px;">
         <thead>
           <tr style="background:#eee;">
-            <th style="border:1px solid #000;padding:8px;text-align:left;width:20%;">Caixa</th>
-            <th style="border:1px solid #000;padding:8px;text-align:left;width:20%;">Filial Origem</th>
+            <th style="border:1px solid #000;padding:8px;text-align:left;width:25%;">Caixa</th>
             <th style="border:1px solid #000;padding:8px;text-align:left;">Destino</th>
-            <th style="border:1px solid #000;padding:8px;text-align:right;width:12%;">Qtde Peças</th>
+            <th style="border:1px solid #000;padding:8px;text-align:right;width:15%;">Qtde Peças</th>
           </tr>
         </thead>
         <tbody>
           {"".join([
             f"<tr>"
             f"<td style='border:1px solid #000;padding:8px;'>{r.get('caixa','')}</td>"
-            f"<td style='border:1px solid #000;padding:8px;'>{r.get('filial_origem','')}</td>"
             f"<td style='border:1px solid #000;padding:8px;'>{r.get('destino','')}</td>"
             f"<td style='border:1px solid #000;padding:8px;text-align:right;'>{int(r.get('qtde_pecas',0) or 0)}</td>"
             f"</tr>"
@@ -1136,94 +1134,183 @@ with tab_op:
 # =========================================================
 with tab_base:
     st.title("📊 Consulta e Reimpressão")
+
+    tipo_consulta = st.radio(
+        "Tipo de consulta",
+        ["Romaneio Reserva", "Romaneio Pavuna (Espelho)"],
+        horizontal=True
+    )
+
     with st.container(border=True):
         c1, c2, c3 = st.columns(3)
         f_rom = c1.text_input("Pesquisar Nº Romaneio", key="filter_rom")
-        dt_ini = c2.date_input("Início", value=None)
-        dt_fim = c3.date_input("Fim", value=None)
+        dt_ini = c2.date_input("Início", value=None, key="dt_ini_base")
+        dt_fim = c3.date_input("Fim", value=None, key="dt_fim_base")
         btn_search = st.button("🔍 Pesquisar")
 
-    if btn_search or f_rom:
-        q = supabase.table("conferencia_reserva").select("*, romaneios(*)")
-
-        if f_rom and f_rom.isdigit():
-            q = q.eq("romaneio_id", int(f_rom))
-        if dt_ini:
-            dt_ini_full = datetime.combine(dt_ini, time.min).strftime("%Y-%m-%dT%H:%M:%S")
-            q = q.gte("data_expedicao", dt_ini_full)
-        if dt_fim:
-            dt_fim_full = datetime.combine(dt_fim + timedelta(days=1), time.min).strftime("%Y-%m-%dT%H:%M:%S")
-            q = q.lt("data_expedicao", dt_fim_full)
-
-        res = q.order("data_expedicao", desc=True).execute()
-
-        if res.data:
-            df = pd.json_normalize(res.data)
-
-            cols_data = [
-                "created_at",
-                "criado_em",
-                "data_expedicao",
-                "data_recebimento",
-                "data_encerramento",
-                "romaneios.created_at",
-                "romaneios.criado_em",
-                "romaneios.data_encerramento",
-            ]
-
-            for col in cols_data:
-                if col in df.columns:
-                    df[col] = df[col].apply(format_datetime_sp)
-
-            sort_cols = []
-            if "romaneio_id" in df.columns:
-                sort_cols.append("romaneio_id")
-            if "destino" in df.columns:
-                sort_cols.append("destino")
-            if "chave_nfe" in df.columns:
-                sort_cols.append("chave_nfe")
-            if sort_cols:
-                df = df.sort_values(sort_cols, ascending=True)
-
-            rename_map = {
-                "romaneio_id": "Romaneio",
-                "chave_nfe": "CAIXA",
-                "destino": "Destino",
-                "data_expedicao": "Data Expedição",
-                "data_recebimento": "Data Recebimento",
-                "created_at": "Criado em",
-                "criado_em": "Criado em",
-                "data_encerramento": "Data Encerramento",
-                "romaneios.usuario_criou": "Usuário",
-                "romaneios.unidade_origem": "Unidade Origem",
-                "romaneios.created_at": "Romaneio Criado em",
-                "romaneios.criado_em": "Romaneio Criado em",
-                "romaneios.data_encerramento": "Romaneio Encerrado em",
-            }
-            df = df.rename(columns=rename_map)
-
-            st.dataframe(df, width="stretch")
+    # =====================================================
+    # CONSULTA ROMANEIO RESERVA
+    # =====================================================
+    if tipo_consulta == "Romaneio Reserva":
+        if btn_search or f_rom:
+            q = supabase.table("conferencia_reserva").select("*, romaneios(*)")
 
             if f_rom and f_rom.isdigit():
-                st.divider()
-                if st.button("📥 Reimprimir Romaneio"):
-                    rid = int(f_rom)
-                    rr = (
-                        supabase.table("conferencia_reserva")
-                        .select("chave_nfe, destino, romaneios(usuario_criou, unidade_origem)")
-                        .eq("romaneio_id", rid)
-                        .order("id", desc=False)
-                        .execute()
-                    )
+                q = q.eq("romaneio_id", int(f_rom))
+            if dt_ini:
+                dt_ini_full = datetime.combine(dt_ini, time.min).strftime("%Y-%m-%dT%H:%M:%S")
+                q = q.gte("data_expedicao", dt_ini_full)
+            if dt_fim:
+                dt_fim_full = datetime.combine(dt_fim + timedelta(days=1), time.min).strftime("%Y-%m-%dT%H:%M:%S")
+                q = q.lt("data_expedicao", dt_fim_full)
 
-                    if rr.data:
-                        df_print = pd.DataFrame(
-                            [{"caixa": x.get("chave_nfe", ""), "destino": x.get("destino", "")} for x in rr.data]
+            res = q.order("data_expedicao", desc=True).execute()
+
+            if res.data:
+                df = pd.json_normalize(res.data)
+
+                cols_data = [
+                    "created_at",
+                    "criado_em",
+                    "data_expedicao",
+                    "data_recebimento",
+                    "data_encerramento",
+                    "romaneios.created_at",
+                    "romaneios.criado_em",
+                    "romaneios.data_encerramento",
+                ]
+
+                for col in cols_data:
+                    if col in df.columns:
+                        df[col] = df[col].apply(format_datetime_sp)
+
+                sort_cols = []
+                if "romaneio_id" in df.columns:
+                    sort_cols.append("romaneio_id")
+                if "destino" in df.columns:
+                    sort_cols.append("destino")
+                if "chave_nfe" in df.columns:
+                    sort_cols.append("chave_nfe")
+                if sort_cols:
+                    df = df.sort_values(sort_cols, ascending=True)
+
+                rename_map = {
+                    "romaneio_id": "Romaneio",
+                    "chave_nfe": "CAIXA",
+                    "destino": "Destino",
+                    "data_expedicao": "Data Expedição",
+                    "data_recebimento": "Data Recebimento",
+                    "created_at": "Criado em",
+                    "criado_em": "Criado em",
+                    "data_encerramento": "Data Encerramento",
+                    "romaneios.usuario_criou": "Usuário",
+                    "romaneios.unidade_origem": "Unidade Origem",
+                    "romaneios.created_at": "Romaneio Criado em",
+                    "romaneios.criado_em": "Romaneio Criado em",
+                    "romaneios.data_encerramento": "Romaneio Encerrado em",
+                }
+                df = df.rename(columns=rename_map)
+
+                st.dataframe(df, width="stretch")
+
+                if f_rom and f_rom.isdigit():
+                    st.divider()
+                    if st.button("📥 Reimprimir Romaneio Reserva"):
+                        rid = int(f_rom)
+                        rr = (
+                            supabase.table("conferencia_reserva")
+                            .select("chave_nfe, destino, romaneios(usuario_criou, unidade_origem)")
+                            .eq("romaneio_id", rid)
+                            .order("id", desc=False)
+                            .execute()
                         )
-                        usuario = rr.data[0]["romaneios"].get("usuario_criou", "")
-                        origem = rr.data[0]["romaneios"].get("unidade_origem", "")
-                        imprimir_romaneio_html(rid, df_print, usuario, origem)
-                    else:
-                        st.warning("Nenhum volume encontrado para este romaneio.")
-        else:
-            st.warning("Nenhum registro encontrado.")
+
+                        if rr.data:
+                            df_print = pd.DataFrame(
+                                [{"caixa": x.get("chave_nfe", ""), "destino": x.get("destino", "")} for x in rr.data]
+                            )
+                            usuario = rr.data[0]["romaneios"].get("usuario_criou", "")
+                            origem = rr.data[0]["romaneios"].get("unidade_origem", "")
+                            imprimir_romaneio_html(rid, df_print, usuario, origem)
+                        else:
+                            st.warning("Nenhum volume encontrado para este romaneio.")
+            else:
+                st.warning("Nenhum registro encontrado.")
+
+    # =====================================================
+    # CONSULTA ROMANEIO PAVUNA / ESPELHO
+    # =====================================================
+    else:
+        if btn_search or f_rom:
+            q = supabase.table("romaneios_espelho").select("*")
+
+            if f_rom and f_rom.isdigit():
+                q = q.eq("id", int(f_rom))
+            if dt_ini:
+                dt_ini_full = datetime.combine(dt_ini, time.min).strftime("%Y-%m-%dT%H:%M:%S")
+                q = q.gte("created_at", dt_ini_full)
+            if dt_fim:
+                dt_fim_full = datetime.combine(dt_fim + timedelta(days=1), time.min).strftime("%Y-%m-%dT%H:%M:%S")
+                q = q.lt("created_at", dt_fim_full)
+
+            res = q.order("id", desc=True).execute()
+
+            if res.data:
+                df = pd.DataFrame(res.data)
+
+                for col in ["created_at", "criado_em"]:
+                    if col in df.columns:
+                        df[col] = df[col].apply(format_datetime_sp)
+
+                rename_map = {
+                    "id": "Romaneio Espelho",
+                    "usuario_criou": "Usuário",
+                    "unidade_origem": "Unidade Origem",
+                    "status": "Status",
+                    "romaneios_origem": "Romaneios Origem",
+                    "qtd_caixas": "Qtd Caixas",
+                    "rota": "Rota",
+                    "created_at": "Criado em",
+                    "criado_em": "Criado em",
+                }
+                df = df.rename(columns=rename_map)
+
+                st.dataframe(df, width="stretch")
+
+                if f_rom and f_rom.isdigit():
+                    st.divider()
+                    if st.button("🖨️ Reimprimir Romaneio Pavuna"):
+                        rid = int(f_rom)
+
+                        rom = (
+                            supabase.table("romaneios_espelho")
+                            .select("*")
+                            .eq("id", rid)
+                            .limit(1)
+                            .execute()
+                        )
+
+                        itens = (
+                            supabase.table("romaneio_espelho_itens")
+                            .select("caixa, destino, qtde_pecas")
+                            .eq("romaneio_espelho_id", rid)
+                            .order("destino", desc=False)
+                            .execute()
+                        )
+
+                        if rom.data and itens.data:
+                            df_print = pd.DataFrame(itens.data)
+                            usuario = rom.data[0].get("usuario_criou", "")
+                            origem = rom.data[0].get("unidade_origem", "CD Pavuna")
+                            rota = rom.data[0].get("rota", "")
+                            imprimir_romaneio_espelho_html(
+                                id_romaneio=rid,
+                                usuario=usuario,
+                                origem=origem,
+                                rota=rota,
+                                df_itens=df_print,
+                            )
+                        else:
+                            st.warning("Nenhum item encontrado para este romaneio espelho.")
+            else:
+                st.warning("Nenhum registro encontrado.")
