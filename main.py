@@ -238,10 +238,32 @@ def buscar_caixas_ja_expedidas(caixas: list[str]) -> pd.DataFrame:
     return df[["caixa", "romaneio_espelho_id"]]
 
 
+def montar_df_reserva_com_destino(rows) -> pd.DataFrame:
+    """
+    Recebe linhas de conferencia_reserva e garante a coluna destino.
+    Se destino vier vazio, busca na tabela faturamento pela caixa.
+    """
+    dados = []
+    for x in rows:
+        caixa = x.get("chave_nfe", "") or x.get("caixa", "")
+        destino = x.get("destino", "")
+
+        if not destino:
+            destino_fat, _ = buscar_destino_por_caixa(caixa)
+            destino = destino_fat or ""
+
+        dados.append({
+            "caixa": caixa,
+            "destino": destino,
+        })
+
+    return pd.DataFrame(dados)
+
+
 # =========================================================
 # IMPRESSÃO - ROMANEIO RESERVA/PAVUNA (simples: caixa + destino)
 # =========================================================
-def imprimir_romaneio_html(id_romaneio, df_volumes, usuario, origem):
+def imprimir_romaneio_html(id_romaneio, df_volumes, usuario, origem, rota=""):
     agora_br = datetime.now(FUSO_SP).strftime("%d/%m/%Y %H:%M")
 
     df_print = df_volumes.copy()
@@ -268,6 +290,7 @@ def imprimir_romaneio_html(id_romaneio, df_volumes, usuario, origem):
         <p>
           <strong>Nº Romaneio:</strong> {id_romaneio} |
           <strong>Origem:</strong> {origem} |
+          <strong>Rota:</strong> {rota} |
           <strong>Qtd. Volumes:</strong> {qtd_volumes}
         </p>
 
@@ -457,25 +480,25 @@ with tab_op:
                 if st.button("🖨️ IMPRIMIR ROMANEIO (RESERVA)", type="primary", key="btn_print_reserva"):
                     rr = (
                         supabase.table("conferencia_reserva")
-                        .select("chave_nfe, destino, romaneios(usuario_criou, unidade_origem)")
+                        .select("chave_nfe, destino, romaneios(usuario_criou, unidade_origem, rota)")
                         .eq("romaneio_id", rid)
                         .order("id", desc=False)
                         .execute()
                     )
                     if rr.data:
-                        df_print = pd.DataFrame([
-                            {"caixa": x.get("chave_nfe", ""), "destino": x.get("destino", "")}
-                            for x in rr.data
-                        ])
+                        df_print = montar_df_reserva_com_destino(rr.data)
                         usuario = rr.data[0]["romaneios"].get("usuario_criou", "")
                         origem = rr.data[0]["romaneios"].get("unidade_origem", "CD Reserva")
-                        imprimir_romaneio_html(rid, df_print, usuario, origem)
+                        rota = rr.data[0]["romaneios"].get("rota", "")
+                        imprimir_romaneio_html(rid, df_print, usuario, origem, rota)
                     else:
                         st.warning("Nenhum volume encontrado para este romaneio.")
 
             with colp2:
                 if st.button("✅ OK / NOVO ROMANEIO", key="btn_clear_print_reserva"):
                     del st.session_state["print_romaneio_id_reserva"]
+                    if "rota_reserva" in st.session_state:
+                        del st.session_state["rota_reserva"]
                     st.rerun()
 
             st.divider()
@@ -487,14 +510,22 @@ with tab_op:
                         "usuario_criou": st.session_state["user_email"],
                         "unidade_origem": "CD Reserva",
                         "status": "Aberto",
+                        "rota": None,
                     }
                 ).execute()
                 st.session_state["romaneio_id"] = res.data[0]["id"]
+                st.session_state["rota_reserva"] = ""
                 st.rerun()
 
         else:
             id_atual = int(st.session_state["romaneio_id"])
             st.info(f"📦 Romaneio Ativo: **#{id_atual}**")
+
+            st.text_input(
+                "Rota",
+                key="rota_reserva",
+                placeholder="Ex.: ROTA 01, ROTA 02, ROTA 100"
+            )
 
             res_count = (
                 supabase.table("conferencia_reserva")
@@ -504,6 +535,70 @@ with tab_op:
             )
             total_bipado = res_count.count if res_count.count else 0
             st.metric(label="Volumes Bipados", value=total_bipado)
+
+            res_itens_reserva = (
+                supabase.table("conferencia_reserva")
+                .select("id, chave_nfe, destino")
+                .eq("romaneio_id", id_atual)
+                .order("id", desc=False)
+                .execute()
+            )
+
+            itens_reserva = res_itens_reserva.data or []
+
+            if itens_reserva:
+                df_itens_reserva = pd.DataFrame(itens_reserva)
+
+                if "destino" not in df_itens_reserva.columns:
+                    df_itens_reserva["destino"] = ""
+
+                destinos_corrigidos = []
+                for _, row in df_itens_reserva.iterrows():
+                    destino = row.get("destino", "")
+                    caixa = row.get("chave_nfe", "")
+                    if not destino:
+                        destino_fat, _ = buscar_destino_por_caixa(caixa)
+                        destino = destino_fat or ""
+                    destinos_corrigidos.append(destino)
+
+                df_itens_reserva["destino"] = destinos_corrigidos
+
+                st.write("### Caixas já inseridas no romaneio")
+                st.dataframe(
+                    df_itens_reserva[["chave_nfe", "destino"]].rename(columns={
+                        "chave_nfe": "CAIXA",
+                        "destino": "Destino"
+                    }),
+                    width="stretch"
+                )
+
+                col_del1, col_del2 = st.columns([3, 1])
+
+                with col_del1:
+                    caixa_excluir = st.selectbox(
+                        "Selecione uma caixa para excluir",
+                        options=[""] + df_itens_reserva["chave_nfe"].astype(str).tolist(),
+                        key="caixa_excluir_reserva"
+                    )
+
+                with col_del2:
+                    st.write("")
+                    st.write("")
+                    if st.button("🗑️ Excluir Caixa", key="btn_excluir_caixa_reserva"):
+                        if not caixa_excluir:
+                            st.warning("Selecione uma caixa para excluir.")
+                        else:
+                            try:
+                                supabase.table("conferencia_reserva") \
+                                    .delete() \
+                                    .eq("romaneio_id", id_atual) \
+                                    .eq("chave_nfe", caixa_excluir) \
+                                    .execute()
+
+                                st.success(f"✅ Caixa excluída: {caixa_excluir}")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Erro ao excluir caixa: {e}")
 
             def reg_reserva():
                 raw = st.session_state.get("input_reserva")
@@ -553,9 +648,16 @@ with tab_op:
             st.text_input("Bipe os volumes:", key="input_reserva", on_change=reg_reserva)
 
             if st.button("🏁 ENCERRAR ROMANEIO", key="btn_fecha_rom_reserva"):
+                rota = (st.session_state.get("rota_reserva") or "").strip().upper()
+
+                if not rota:
+                    st.error("Informe a rota antes de encerrar o romaneio.")
+                    st.stop()
+
                 supabase.table("romaneios").update({
                     "status": "Encerrado",
                     "data_encerramento": get_now_utc(),
+                    "rota": rota,
                 }).eq("id", id_atual).execute()
 
                 st.session_state["print_romaneio_id_reserva"] = id_atual
@@ -1205,6 +1307,7 @@ with tab_base:
                     "data_encerramento": "Data Encerramento",
                     "romaneios.usuario_criou": "Usuário",
                     "romaneios.unidade_origem": "Unidade Origem",
+                    "romaneios.rota": "Rota",
                     "romaneios.created_at": "Romaneio Criado em",
                     "romaneios.criado_em": "Romaneio Criado em",
                     "romaneios.data_encerramento": "Romaneio Encerrado em",
@@ -1219,19 +1322,18 @@ with tab_base:
                         rid = int(f_rom)
                         rr = (
                             supabase.table("conferencia_reserva")
-                            .select("chave_nfe, destino, romaneios(usuario_criou, unidade_origem)")
+                            .select("chave_nfe, destino, romaneios(usuario_criou, unidade_origem, rota)")
                             .eq("romaneio_id", rid)
                             .order("id", desc=False)
                             .execute()
                         )
 
                         if rr.data:
-                            df_print = pd.DataFrame(
-                                [{"caixa": x.get("chave_nfe", ""), "destino": x.get("destino", "")} for x in rr.data]
-                            )
+                            df_print = montar_df_reserva_com_destino(rr.data)
                             usuario = rr.data[0]["romaneios"].get("usuario_criou", "")
                             origem = rr.data[0]["romaneios"].get("unidade_origem", "")
-                            imprimir_romaneio_html(rid, df_print, usuario, origem)
+                            rota = rr.data[0]["romaneios"].get("rota", "")
+                            imprimir_romaneio_html(rid, df_print, usuario, origem, rota)
                         else:
                             st.warning("Nenhum volume encontrado para este romaneio.")
             else:
