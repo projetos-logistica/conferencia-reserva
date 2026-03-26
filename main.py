@@ -1348,12 +1348,15 @@ with tab_base:
 
             if f_rom and f_rom.isdigit():
                 q = q.eq("id", int(f_rom))
+            # blco (corrigido) 26/03/2026:
             if dt_ini:
-                dt_ini_full = datetime.combine(dt_ini, time.min).strftime("%Y-%m-%dT%H:%M:%S")
-                q = q.gte("created_at", dt_ini_full)
+                dt_ini_utc = datetime.combine(dt_ini, time.min).replace(tzinfo=FUSO_SP).astimezone(timezone.utc)
+                dt_ini_full = dt_ini_utc.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+                q = q.gte("criado_em", dt_ini_full)
             if dt_fim:
-                dt_fim_full = datetime.combine(dt_fim + timedelta(days=1), time.min).strftime("%Y-%m-%dT%H:%M:%S")
-                q = q.lt("created_at", dt_fim_full)
+                dt_fim_utc = datetime.combine(dt_fim + timedelta(days=1), time.min).replace(tzinfo=FUSO_SP).astimezone(timezone.utc)
+                dt_fim_full = dt_fim_utc.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+                q = q.lt("criado_em", dt_fim_full)
 
             res = q.order("id", desc=True).execute()
 
