@@ -260,6 +260,63 @@ def montar_df_reserva_com_destino(rows) -> pd.DataFrame:
     return pd.DataFrame(dados)
 
 
+def encerrar_romaneio_reserva_pela_pesquisa(romaneio_id: int, rota: str):
+    """
+    Encerra romaneio da Reserva a partir da tela de pesquisa.
+    Regras:
+    - precisa existir
+    - precisa ser da unidade CD Reserva
+    - não pode já estar encerrado
+    - precisa ter ao menos 1 volume
+    """
+    rota = (rota or "").strip().upper()
+
+    if not rota:
+        return False, "Informe a rota antes de encerrar."
+
+    try:
+        rom = (
+            supabase.table("romaneios")
+            .select("id, status, unidade_origem, rota")
+            .eq("id", int(romaneio_id))
+            .limit(1)
+            .execute()
+        )
+
+        if not rom.data:
+            return False, "Romaneio não encontrado."
+
+        rom_data = rom.data[0]
+
+        if rom_data.get("unidade_origem") != "CD Reserva":
+            return False, "Somente romaneios do CD Reserva podem ser encerrados aqui."
+
+        if rom_data.get("status") == "Encerrado":
+            return False, "Este romaneio já está encerrado."
+
+        qtd = (
+            supabase.table("conferencia_reserva")
+            .select("id", count="exact")
+            .eq("romaneio_id", int(romaneio_id))
+            .execute()
+        )
+
+        total_volumes = qtd.count if qtd.count else 0
+        if total_volumes == 0:
+            return False, "Não é possível encerrar um romaneio sem volumes."
+
+        supabase.table("romaneios").update({
+            "status": "Encerrado",
+            "data_encerramento": get_now_utc(),
+            "rota": rota,
+        }).eq("id", int(romaneio_id)).execute()
+
+        return True, f"Romaneio #{romaneio_id} encerrado com sucesso."
+
+    except Exception as e:
+        return False, f"Erro ao encerrar romaneio: {e}"
+
+
 # =========================================================
 # IMPRESSÃO - ROMANEIO RESERVA/PAVUNA (simples: caixa + destino)
 # =========================================================
@@ -723,19 +780,25 @@ with tab_op:
                         faltando = [i for i in ids if i not in encontrados]
                         invalidos = []
                         validos = []
+                        romaneios_abertos = []
+
                         for i in ids:
                             r = encontrados.get(i)
                             if not r:
                                 continue
-                            if r.get("status") != "Encerrado" or r.get("unidade_origem") != "CD Reserva":
+                            if r.get("unidade_origem") != "CD Reserva":
                                 invalidos.append(i)
+                            elif r.get("status") != "Encerrado":
+                                romaneios_abertos.append(i)
                             else:
                                 validos.append(i)
 
                         if faltando:
                             st.warning(f"⚠️ Não encontrados no Supabase: {faltando}")
                         if invalidos:
-                            st.error(f"❌ Inválidos (não encerrados ou não são da Reserva): {invalidos}")
+                            st.error(f"❌ Não pertencem ao CD Reserva: {invalidos}")
+                        if romaneios_abertos:
+                            st.error(f"⚠️ Ainda abertos. Encerre pela tela de pesquisa antes do recebimento: {romaneios_abertos}")
                         if not validos:
                             st.error("Nenhum romaneio válido para conferência.")
                             st.stop()
@@ -883,15 +946,27 @@ with tab_op:
                             supabase.table("romaneios")
                             .select("*")
                             .eq("id", int(id_input))
-                            .eq("status", "Encerrado")
+                            .limit(1)
                             .execute()
                         )
-                        if check.data and check.data[0].get("unidade_origem") == "CD Reserva":
-                            st.session_state["romaneio_pavuna_single"] = int(id_input)
-                            st.session_state["conferidos_single"] = []
-                            st.rerun()
-                        else:
-                            st.error("❌ Romaneio inválido, ainda aberto ou não é da Reserva.")
+
+                        if not check.data:
+                            st.error("❌ Romaneio não encontrado.")
+                            st.stop()
+
+                        rom = check.data[0]
+
+                        if rom.get("unidade_origem") != "CD Reserva":
+                            st.error("❌ O romaneio informado não pertence ao CD Reserva.")
+                            st.stop()
+
+                        if rom.get("status") != "Encerrado":
+                            st.error("⚠️ Este romaneio ainda está ABERTO. Vá na tela de pesquisa e encerre antes do recebimento.")
+                            st.stop()
+
+                        st.session_state["romaneio_pavuna_single"] = int(id_input)
+                        st.session_state["conferidos_single"] = []
+                        st.rerun()
                 else:
                     rom_id = int(st.session_state["romaneio_pavuna_single"])
                     st.info(f"✅ Conferindo Romaneio (Reserva): **#{rom_id}**")
@@ -1307,6 +1382,7 @@ with tab_base:
                     "data_encerramento": "Data Encerramento",
                     "romaneios.usuario_criou": "Usuário",
                     "romaneios.unidade_origem": "Unidade Origem",
+                    "romaneios.status": "Status Romaneio",
                     "romaneios.rota": "Rota",
                     "romaneios.created_at": "Romaneio Criado em",
                     "romaneios.criado_em": "Romaneio Criado em",
@@ -1317,25 +1393,66 @@ with tab_base:
                 st.dataframe(df, width="stretch")
 
                 if f_rom and f_rom.isdigit():
+                    rid = int(f_rom)
+
                     st.divider()
-                    if st.button("📥 Reimprimir Romaneio Reserva"):
-                        rid = int(f_rom)
-                        rr = (
-                            supabase.table("conferencia_reserva")
-                            .select("chave_nfe, destino, romaneios(usuario_criou, unidade_origem, rota)")
-                            .eq("romaneio_id", rid)
-                            .order("id", desc=False)
-                            .execute()
+
+                    rom_info = (
+                        supabase.table("romaneios")
+                        .select("id, status, unidade_origem, rota, usuario_criou, data_encerramento")
+                        .eq("id", rid)
+                        .limit(1)
+                        .execute()
+                    )
+
+                    if rom_info.data:
+                        rom = rom_info.data[0]
+
+                        st.write("### Ações do Romaneio Reserva")
+
+                        cinfo1, cinfo2, cinfo3 = st.columns(3)
+                        cinfo1.metric("Romaneio", rom.get("id", ""))
+                        cinfo2.metric("Status", rom.get("status", ""))
+                        cinfo3.metric("Unidade Origem", rom.get("unidade_origem", ""))
+
+                        rota_pesquisa = st.text_input(
+                            "Rota para encerramento / correção",
+                            value=(rom.get("rota") or ""),
+                            key=f"rota_encerrar_pesquisa_{rid}",
+                            placeholder="Ex.: ROTA 01"
                         )
 
-                        if rr.data:
-                            df_print = montar_df_reserva_com_destino(rr.data)
-                            usuario = rr.data[0]["romaneios"].get("usuario_criou", "")
-                            origem = rr.data[0]["romaneios"].get("unidade_origem", "")
-                            rota = rr.data[0]["romaneios"].get("rota", "")
-                            imprimir_romaneio_html(rid, df_print, usuario, origem, rota)
-                        else:
-                            st.warning("Nenhum volume encontrado para este romaneio.")
+                        cbtn1, cbtn2 = st.columns([1, 1])
+
+                        with cbtn1:
+                            if st.button("🏁 Encerrar Romaneio Reserva", key=f"btn_encerrar_reserva_pesquisa_{rid}"):
+                                ok, msg = encerrar_romaneio_reserva_pela_pesquisa(rid, rota_pesquisa)
+                                if ok:
+                                    st.success(msg)
+                                    st.rerun()
+                                else:
+                                    st.error(msg)
+
+                        with cbtn2:
+                            if st.button("📥 Reimprimir Romaneio Reserva", key=f"btn_reprint_reserva_{rid}"):
+                                rr = (
+                                    supabase.table("conferencia_reserva")
+                                    .select("chave_nfe, destino, romaneios(usuario_criou, unidade_origem, rota)")
+                                    .eq("romaneio_id", rid)
+                                    .order("id", desc=False)
+                                    .execute()
+                                )
+
+                                if rr.data:
+                                    df_print = montar_df_reserva_com_destino(rr.data)
+                                    usuario = rr.data[0]["romaneios"].get("usuario_criou", "")
+                                    origem = rr.data[0]["romaneios"].get("unidade_origem", "")
+                                    rota = rr.data[0]["romaneios"].get("rota", "")
+                                    imprimir_romaneio_html(rid, df_print, usuario, origem, rota)
+                                else:
+                                    st.warning("Nenhum volume encontrado para este romaneio.")
+                    else:
+                        st.warning("Romaneio não encontrado na tabela romaneios.")
             else:
                 st.warning("Nenhum registro encontrado.")
 
@@ -1348,7 +1465,6 @@ with tab_base:
 
             if f_rom and f_rom.isdigit():
                 q = q.eq("id", int(f_rom))
-            # blco (corrigido) 26/03/2026:
             if dt_ini:
                 dt_ini_utc = datetime.combine(dt_ini, time.min).replace(tzinfo=FUSO_SP).astimezone(timezone.utc)
                 dt_ini_full = dt_ini_utc.strftime("%Y-%m-%dT%H:%M:%S+00:00")
